@@ -1,0 +1,368 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Tue May 18 16:24:58 2021
+
+@author: Jonathas Haniel
+
+PINN with navier-stokes loss functions
+
+using tensorflow 2.5.0
+"""
+import tensorflow as tf
+import numpy as np
+import time
+from datetime import datetime
+
+
+
+
+class PINN(object):
+  def __init__(self, optimizer, logger, X_f,pinn_w = [1,1,1,1,1,1], rho = 1, mu = 0.0001, Steady = False):
+    self.mu = mu
+    self.rho = rho
+    self.optimizer = optimizer
+    self.logger = logger
+    self.dtype = tf.float32
+    self.pinn_w = pinn_w #tf.constant(pinn_w, dtype=self.dtype)
+    self.X_pinn_train = tf.convert_to_tensor(X_f, dtype=self.dtype)
+    self.steady  = Steady
+    self.X_outside = tf.convert_to_tensor([], dtype=self.dtype)
+
+  def Foward(self,layers,activation):
+    # Keras model, defined by layers
+    self.model = tf.keras.Sequential()
+    self.model.add(tf.keras.layers.InputLayer(input_shape=(layers[0],)))
+    for width in layers[1:]:
+      if not width == layers[-1]:
+        self.model.add(tf.keras.layers.Dense(
+            width, activation=activation,
+            kernel_initializer='glorot_normal',
+            # kernel_constraint= tf.keras.constraints.MinMaxNorm(min_value=-4.0, max_value=4.0),
+            # kernel_regularizer=tf.keras.regularizers.l2(0.001)
+            ))
+        # self.model.add(tf.keras.layers.Dropout(0.1))
+      else:
+        self.model.add(tf.keras.layers.Dense(
+            width, activation=activation,
+            kernel_initializer='glorot_normal'))
+
+  def Multi_channel_foward(self,layers,activation):
+    input = tf.keras.Input(shape=(layers[0][0],), dtype=self.dtype, name='input (x,y,t)')
+    x = tf.keras.layers.Dense(layers[0][1], activation=activation,
+                              kernel_initializer='glorot_normal')(input)
+    y = tf.keras.layers.Dense(layers[1][1], activation=activation,
+                              kernel_initializer='glorot_normal')(input)
+    z = tf.keras.layers.Dense(layers[2][1], activation=activation,
+                              kernel_initializer='glorot_normal')(input)
+    for width in layers[0][2:-1]:
+      x = tf.keras.layers.Dense(width, activation=activation,
+                                kernel_initializer='glorot_normal')(x)
+    for width in layers[1][2:-1]:
+      y = tf.keras.layers.Dense(width, activation=activation,
+                                kernel_initializer='glorot_normal')(y)
+    for width in layers[2][2:-1]:
+      z = tf.keras.layers.Dense(width, activation=activation,
+                                kernel_initializer='glorot_normal')(z)
+    output0 = tf.keras.layers.Dense(layers[0][-1], activation= activation,
+                                    kernel_initializer='glorot_normal', name='u')(x)
+    output1 = tf.keras.layers.Dense(layers[0][-1], activation= activation,
+                                    kernel_initializer='glorot_normal', name='v')(y)
+    output2 = tf.keras.layers.Dense(layers[0][-1], activation= activation,
+                                    kernel_initializer='glorot_normal', name='p')(z)
+    output = tf.keras.layers.concatenate([output0,output1,output2])
+    self.model = tf.keras.Model(inputs=[input], outputs=[output])
+
+  def Foward_residual(self,layers,activation):
+
+    input = tf.keras.Input(shape=(layers[0],), name='input (x,y,t)')
+    u = 0
+    for width in layers[1:-1]:
+      if  u <  1:
+        x = input
+      u += 1
+      x = tf.keras.layers.Dense(width, activation=activation,
+                              kernel_initializer='glorot_normal')(x)
+      x1 = tf.keras.layers.Dense(width, activation=activation,
+                              kernel_initializer='glorot_normal')(x)
+      x1 = tf.keras.layers.Dense(width,kernel_initializer='glorot_normal')(x1)
+      x = tf.keras.layers.Add()([x,x1])
+      x = activation(x)
+    output = tf.keras.layers.Dense(layers[-1], activation=activation,
+                              kernel_initializer='glorot_normal')(x)
+    self.model = tf.keras.Model(inputs=[input], outputs=[output])
+
+  def Multi_channel_foward_residual(self,layers,activation):
+    input = tf.keras.Input(shape=(layers[0][0],), name='input (x,y,t)')
+    u = 0
+    for width in layers[0][1:-1]:
+      if  u <  1:
+        x = input
+      u += 1
+      x = tf.keras.layers.Dense(width, activation=activation,
+                              kernel_initializer='glorot_normal')(x)
+      x1 = tf.keras.layers.Dense(width, activation=activation,
+                              kernel_initializer='glorot_normal')(x)
+      x1 = tf.keras.layers.Dense(width,kernel_initializer='glorot_normal')(x1)
+      x = tf.keras.layers.Add()([x,x1])
+      x = activation(x)
+    u = 0
+    for width in layers[1][1:-1]:
+      if  u <  1:
+        y = input
+      u += 1
+      y = tf.keras.layers.Dense(width, activation=activation,
+                              kernel_initializer='glorot_normal')(y)
+      y1 = tf.keras.layers.Dense(width, activation=activation,
+                              kernel_initializer='glorot_normal')(y)
+      y1 = tf.keras.layers.Dense(width,kernel_initializer='glorot_normal')(y1)
+      y = tf.keras.layers.Add()([y,y1])
+      y = activation(y)
+    u = 0
+    for width in layers[2][1:-1]:
+      if  u <  1:
+        z = input
+      u += 1
+      z = tf.keras.layers.Dense(width, activation=activation,
+                              kernel_initializer='glorot_normal')(z)
+      z1 = tf.keras.layers.Dense(width, activation=activation,
+                              kernel_initializer='glorot_normal')(z)
+      z1 = tf.keras.layers.Dense(width,kernel_initializer='glorot_normal')(z1)
+      z = tf.keras.layers.Add()([z,z1])
+      z = activation(z)
+
+    output0 = tf.keras.layers.Dense(layers[0][-1], activation= activation,
+                                    kernel_initializer='glorot_normal', name='u')(x)
+    output1 = tf.keras.layers.Dense(layers[0][-1], activation= activation,
+                                    kernel_initializer='glorot_normal', name='v')(y)
+    output2 = tf.keras.layers.Dense(layers[0][-1], activation= activation,
+                                    kernel_initializer='glorot_normal', name='p')(z)
+    output = tf.keras.layers.concatenate([output0,output1,output2])
+    self.model = tf.keras.Model(inputs=[input], outputs=[output])
+
+    dot_img_file = '.\model_plot_test.png'
+    tf.keras.utils.plot_model(self.model, to_file=dot_img_file, show_shapes=True)
+    
+    
+  # calculate loss gradients to update weights and bias
+  @tf.function
+  def f_grad(self, x_batch, y_batch, t_batch, X_bd_vel, Y_bd_vel,
+             X_bd_pre, Y_bd_pre,X_data,Y_data,w=[]):
+    with tf.GradientTape() as tape:
+      if not len(w) == 0:
+        # self.set_weights(w)
+        print('ERROR Weights')
+      loss_value,losses = self.f_loss(x_batch, y_batch, t_batch,
+                                      X_bd_vel, Y_bd_vel,X_bd_pre, 
+                                      Y_bd_pre,X_data,Y_data)
+    return loss_value, tape.gradient(loss_value, self.model.trainable_variables), losses
+
+
+  # Defining custom loss
+  @tf.function
+  def f_loss(self, x_batch, y_batch, t_batch, 
+             X_bd_velocity, Y_bd_velocity, X_bd_pressure,Y_bd_pressure, X_data,Y_data):
+    # verify and calculate loss data and/or boundary
+    if Y_bd_velocity.shape[0]>0:
+      loss_bd_vel = Y_bd_velocity - \
+        tf.cast(self.model(X_bd_velocity,training=True)[:, 0:2], self.dtype)
+    else:
+      loss_bd_vel =tf.constant(0, dtype = self.dtype)
+    if self.X_outside.shape[0] > 0:
+      loss_out_vel = tf.cast(self.model(self.X_outside,training=True)[:, 0:2], self.dtype)
+    else:
+      loss_out_vel =tf.constant(0, dtype = self.dtype)
+    
+    if Y_bd_pressure.shape[0]>0:
+      loss_bd_pre = Y_bd_pressure - \
+        tf.cast(self.model(X_bd_pressure,training=True)[:, 2:3], self.dtype)
+    else:
+      loss_bd_pre =tf.constant(0, dtype = self.dtype)
+
+    if Y_data.shape[0]>0:
+      if Y_data.shape[1]==3:
+        loss_data = Y_data - tf.cast(self.model(X_data,training=True), self.dtype)
+      elif Y_data.shape[1]==2:
+        loss_data = Y_data[:,0:2] - tf.cast(self.model(X_data,training=True), self.dtype)[:,0:2]
+    else:
+      loss_data = tf.constant(0, dtype = self.dtype)
+    # calculate loss by Navier-Stokes
+    loss_momentum, loss_mass = self.f_loss_PINN(x_batch, y_batch, t_batch)
+
+    l1 = tf.math.scalar_mul(self.pinn_w[0],tf.reduce_mean(tf.math.log(tf.math.cosh(loss_momentum))))
+    l2 = tf.math.scalar_mul(self.pinn_w[1],tf.reduce_mean(tf.math.log(tf.math.cosh(loss_mass))))
+    l3 = tf.math.scalar_mul(self.pinn_w[2],tf.reduce_mean(tf.math.abs(loss_bd_vel)))
+    l4 = tf.math.scalar_mul(self.pinn_w[3],tf.reduce_mean(tf.math.abs(loss_bd_pre)))
+    l5 = tf.math.scalar_mul(self.pinn_w[4],tf.reduce_mean(tf.math.abs(loss_data)))
+    l6 = tf.math.scalar_mul(self.pinn_w[5],tf.reduce_mean(tf.math.abs(loss_out_vel)))
+
+    # l1 = tf.math.scalar_mul(self.pinn_w[0],tf.reduce_mean(tf.square(loss_momentum)))
+    # l2 = tf.math.scalar_mul(self.pinn_w[1],tf.reduce_mean(tf.square(loss_mass)))
+    # l3 = tf.math.scalar_mul(self.pinn_w[2],tf.reduce_mean(tf.square(loss_bd_vel)))
+    # l4 = tf.math.scalar_mul(self.pinn_w[3],tf.reduce_mean(tf.square(loss_bd_pre)))
+    # l5 = tf.math.scalar_mul(self.pinn_w[4],tf.reduce_mean(tf.square(loss_data)))
+    # l6 = tf.math.scalar_mul(self.pinn_w[5],tf.reduce_mean(tf.square(loss_out_vel)))
+
+    return l1+l2+l3+l4+l5+l6, [l1, l2, l3, l4 ,l5, l6]
+
+  # Models of PINN loss
+  @tf.function
+  def f_loss_PINN(self, x_batch, y_batch, t_batch):
+    # Using the new GradientTape paradigm of TF2.0,
+    # which keeps track of operations to get the gradient at runtime
+    with tf.GradientTape(persistent=True) as tape:
+      # Watching the three inputs we’ll need later, x , y and t
+      tape.watch(x_batch)
+      tape.watch(y_batch)
+      if not self.steady:
+        tape.watch(t_batch)
+        X_f = tf.stack([x_batch[:,0], y_batch[:,0], t_batch[:,0]], axis=1)
+      else:
+        # Packing together the inputs
+        X_f = tf.stack([x_batch[:,0], y_batch[:,0]], axis=1)
+
+      # Getting the prediction
+      Pred =  tf.cast(self.model(X_f,training=True), self.dtype)
+      u = tf.slice(Pred,[0,0],[-1,1])
+      v = tf.slice(Pred,[0,1],[-1,1])
+      p = tf.slice(Pred,[0,2],[-1,1])
+
+      # Deriving INSIDE the tape (since we’ll need the x derivative of this later, u_xx)
+      u_x = tape.gradient(u, x_batch)
+      v_x = tape.gradient(v, x_batch)
+      u_y = tape.gradient(u, y_batch)
+      v_y = tape.gradient(v, y_batch)
+    
+    # Getting the other derivatives
+    u_xx = tape.gradient(u_x, x_batch)
+    u_yy = tape.gradient(u_y, y_batch)
+    v_xx = tape.gradient(v_x, x_batch)
+    v_yy = tape.gradient(v_y, y_batch)
+    p_x = tape.gradient(p, x_batch)
+    p_y = tape.gradient(p, y_batch)
+    if not self.steady:
+      u_t = tape.gradient(u, t_batch)
+      v_t = tape.gradient(v, t_batch)
+    else:
+      u_t = 0
+      v_t = 0
+    del tape
+
+    # Buidling the PINNs
+    loss_x = self.rho * (u_t + u*u_x + v*u_y) + p_x - self.mu*(u_xx + u_yy )
+    loss_y = self.rho * (v_t + u*v_x + v*v_y) + p_y - self.mu*(v_xx + v_yy )
+    loss_mass = u_x + v_y
+    return (loss_x + loss_y), loss_mass
+
+  # @tf.function
+  def summary(self):
+    return self.model.summary()
+
+  # The training function
+  @tf.function
+  def fit(self, X_bd_vel, Y_bd_vel,X_bd_pre, Y_bd_pre,
+          X_data,Y_data, tf_epochs=5000, batch_size = 128 ):
+
+    self.logger.log_train_start(self)
+    # Creating the tensors
+    X_bd_vel = tf.convert_to_tensor(X_bd_vel, dtype=self.dtype)
+    Y_bd_vel = tf.convert_to_tensor(Y_bd_vel, dtype=self.dtype)
+    X_bd_pre = tf.convert_to_tensor(X_bd_pre, dtype=self.dtype)
+    Y_bd_pre = tf.convert_to_tensor(Y_bd_pre, dtype=self.dtype)
+    X_data = tf.convert_to_tensor(X_data, dtype=self.dtype)
+    Y_data = tf.convert_to_tensor(Y_data, dtype=self.dtype)
+    train_dataset =tf.data.Dataset.from_tensor_slices(self.X_pinn_train)
+    x_batch = tf.convert_to_tensor([], dtype=self.dtype)
+    y_batch = tf.convert_to_tensor([], dtype=self.dtype)
+    t_batch = tf.convert_to_tensor([], dtype=self.dtype)
+    loss_value = tf.convert_to_tensor([], dtype=self.dtype)
+
+    for epoch in range(tf_epochs):
+      # batch step
+      train_batchs = train_dataset.shuffle(10000).batch(batch_size)
+      for step, batch in enumerate(train_batchs):
+        print('b')
+        x_batch = tf.convert_to_tensor(batch[:, 0:1], dtype=self.dtype)
+        y_batch = tf.convert_to_tensor(batch[:, 1:2], dtype=self.dtype)
+        if not self.steady:
+          t_batch = tf.convert_to_tensor(batch[:, 2:3], dtype=self.dtype)
+        # Optimization step
+        loss_value, grads, losses = self.f_grad(x_batch,y_batch,t_batch,
+                                                X_bd_vel, Y_bd_vel,
+                                                X_bd_pre, Y_bd_pre,
+                                                X_data,Y_data)
+        self.optimizer.apply_gradients(zip(grads, self.model.trainable_variables))
+      #   self.logger.log_train_batch(step, loss_value, losses)
+      # self.logger.log_train_epoch(epoch, loss_value)
+      print('***********************epoch')
+    # self.logger.log_train_end(tf_epochs)
+    print('end')
+
+  # @tf.function
+  def predict(self, X_star):
+    u_star = self.model(X_star,training=False)
+    return u_star
+  
+  def set_outside_points(self,points):
+    self.X_outside =tf.convert_to_tensor(points, dtype=self.dtype)
+    return
+
+class Logs(object):
+  def __init__(self, frequency_epoch=10,frequency_batch=10):
+    print("TensorFlow version: {}".format(tf.__version__))
+    print("Eager execution: {}".format(tf.executing_eagerly()))
+    print("GPU-accerelated: {}".format(tf.config.list_physical_devices('GPU')))
+
+    self.start_time = time.time()
+    self.frequency_epoch = frequency_epoch
+    self.frequency_batch = frequency_batch
+    self.error_fn2_flag = False
+    self.loss = []
+    self.error = []
+
+  def __get_elapsed(self):
+    return datetime.fromtimestamp(time.time() - self.start_time).strftime("%M:%S")
+
+  def set_error_fn(self, error_fn,name='error'):
+    self.error_fn = error_fn
+    self.error_fn_name = name
+    
+  def set_error_fn2(self, error_fn,name='error2'):
+    self.error_fn2 = error_fn
+    self.error_fn2_name = name
+    self.error_fn2_flag = True
+   
+  def log_train_start(self, model):
+    print("\nTraining started")
+    print("================")
+    self.model = model
+    print(self.model.summary())
+    print("\nTotal_Loss * 1:Momentum 2:Mass 3:boundary_vel 4:boundary_pre 5:Data 6:boundary_out_vel")
+
+  def log_train_epoch(self, epoch, loss, custom=""):
+    if tf.math.floormod(epoch , self.frequency_epoch) == 0:
+      error = self.error_fn()
+      if self.error_fn2_flag:
+        error2 = self.error_fn2()
+        self.error.append([error,error2])
+        print(f"epoch = {epoch:4d}  elapsed = {self.__get_elapsed()}  loss = {loss:.4e}  {self.error_fn_name} = {error:.4e} {self.error_fn2_name} = {error2:.2e} " + custom)
+      else:  
+        self.error.append([error])
+        print(f"epoch = {epoch:4d}  elapsed = {self.__get_elapsed()}  loss = {loss:.4e}  {self.error_fn_name} = {error:.4e} " + custom)
+      print("Total_Loss * 1:Momentum 2:Mass 3:boundary_vel 4:boundary_pre 5:Data 6:boundary_out_vel")
+
+
+  def log_train_batch(self, batch, loss, losses, custom=""):
+    if tf.math.floormod(batch , self.frequency_batch) == 0:
+      self.loss.append([losses[0].numpy(),losses[1].numpy(),losses[2].numpy(),losses[3].numpy(),losses[4].numpy(),losses[5].numpy()])
+      print(f"batch = {batch:3d}  elapsed = {self.__get_elapsed()}  loss = {loss:.4e} * {losses[0]:.2e} {losses[1]:.2e} {losses[2]:.2e} {losses[3]:.2e} {losses[4]:.2e} {losses[5]:.2e}" + custom)
+
+  def log_train_end(self, epoch, custom=""):
+    print("==================")
+    print(f"Training finished (epoch {epoch}): duration = {self.__get_elapsed()}  error = {self.error_fn():.4e}  " + custom)
+
+  def save(self,path_name):
+    error = np.zeros((np.array(self.loss).shape[0],np.shape(self.error)[1]))
+    error[0:len(np.array(self.error)),:] = np.array(self.error)
+    np.savetxt(path_name,np.concatenate((np.array(self.loss),error),axis=1), delimiter=",")
+
+
