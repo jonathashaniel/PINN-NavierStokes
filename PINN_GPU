@@ -148,9 +148,9 @@ class PINN(object):
   def f_grad(self, x_batch, y_batch, t_batch, X_bd_vel, Y_bd_vel,
              X_bd_pre, Y_bd_pre,X_data,Y_data,w=[]):
     with tf.GradientTape() as tape:
-      if not len(w) == 0:
+      if not tf.size(w) == 0:
         # self.set_weights(w)
-        print('ERROR Weights')
+        tf.print('ERROR Weights')
       loss_value,losses = self.f_loss(x_batch, y_batch, t_batch,
                                       X_bd_vel, Y_bd_vel,X_bd_pre, 
                                       Y_bd_pre,X_data,Y_data)
@@ -258,7 +258,7 @@ class PINN(object):
     return self.model.summary()
 
   # The training function
-  @tf.function
+  # @tf.function
   def fit(self, X_bd_vel, Y_bd_vel,X_bd_pre, Y_bd_pre,
           X_data,Y_data, tf_epochs=5000, batch_size = 128 ):
 
@@ -278,25 +278,34 @@ class PINN(object):
 
     for epoch in range(tf_epochs):
       # batch step
-      train_batchs = train_dataset.shuffle(10000).batch(batch_size)
-      for step, batch in enumerate(train_batchs):
-        print('b')
+      train_batchs = train_dataset.shuffle(self.X_pinn_train.shape[0],reshuffle_each_iteration = True).batch(batch_size).enumerate()
+      for step, batch in train_batchs:
+        step = tf.constant(step)
+        batch = tf.convert_to_tensor(batch, dtype=self.dtype)
         x_batch = tf.convert_to_tensor(batch[:, 0:1], dtype=self.dtype)
         y_batch = tf.convert_to_tensor(batch[:, 1:2], dtype=self.dtype)
         if not self.steady:
           t_batch = tf.convert_to_tensor(batch[:, 2:3], dtype=self.dtype)
         # Optimization step
-        loss_value, grads, losses = self.f_grad(x_batch,y_batch,t_batch,
-                                                X_bd_vel, Y_bd_vel,
-                                                X_bd_pre, Y_bd_pre,
-                                                X_data,Y_data)
-        self.optimizer.apply_gradients(zip(grads, self.model.trainable_variables))
-      #   self.logger.log_train_batch(step, loss_value, losses)
-      # self.logger.log_train_epoch(epoch, loss_value)
-      print('***********************epoch')
-    # self.logger.log_train_end(tf_epochs)
-    print('end')
-
+        loss_value, losses = self.train_step(step, batch,x_batch,y_batch,t_batch, X_bd_vel, Y_bd_vel,
+                                                X_bd_pre, Y_bd_pre,X_data,Y_data)
+        
+        self.logger.log_train_batch(step, loss_value, losses)
+      self.logger.log_train_epoch(epoch, loss_value)
+    self.logger.log_train_end(tf_epochs)
+  
+  @tf.function
+  def train_step(self,step, batch,x_batch,y_batch,t_batch, X_bd_vel, Y_bd_vel,
+                                          X_bd_pre, Y_bd_pre,X_data,Y_data):
+    
+    loss_value, grads, losses = self.f_grad(x_batch,y_batch,t_batch,
+                                            X_bd_vel, Y_bd_vel,
+                                            X_bd_pre, Y_bd_pre,
+                                            X_data,Y_data)
+    self.optimizer.apply_gradients(zip(grads, self.model.trainable_variables))
+    return loss_value, losses
+    
+  
   # @tf.function
   def predict(self, X_star):
     u_star = self.model(X_star,training=False)
