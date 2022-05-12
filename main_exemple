@@ -20,7 +20,7 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '1'  # or any {'0', '1', '2'}
 import tensorflow as tf
 import tensorflow.keras
 import numpy as np
-import PINN_LBFGS as bib
+import PINN_LBFGS_DW as bib
 import My_data
 
 
@@ -44,9 +44,9 @@ tf.random.set_seed(1200)
 N_bd_vel = 800
 N_bd_out = 100
 # Size of Data with solution on fluid domain
-N_data_train = 50
+N_data_train = 100
 # Number of points where we’ll check physic-s informed loss, selected by Latin Hypercube (lhc)
-N_lhc = 1000
+N_lhc = 10000
 
 # Getting the data
 """ Necessary data for the mesh:
@@ -104,8 +104,8 @@ def error2():
 LOGS_FILE = "test_est.csv"
 WEIGHTS_PATH ='.\save\last_weights'
 
-save_weights_flag = False
-use_trained_model_flag = True
+save_weights_flag = True
+use_trained_model_flag = False
 log_frequency_epoch = 1
 log_frequency_batch = 10
 
@@ -116,20 +116,23 @@ layers = [2, nodes,nodes,nodes,nodes,nodes,nodes, 3]
 #           [2, nodes,nodes,nodes,nodes,nodes,nodes,nodes,nodes, 1],
 #           [2, nodes,nodes,nodes,nodes,nodes,nodes,nodes, 1]]
 # layers = [2, nodes,nodes,nodes,3]
-# layers = [[2, nodes,nodes,nodes,1],
-#           [2, nodes,nodes,nodes,1],
-#           [2, nodes,1]]
+#layers = [[2, nodes,nodes,nodes,1],
+#          [2, nodes,nodes,nodes,1],
+#          [2, nodes,nodes,1]]
 
 activation=tf.nn.silu
 # Setting up the TF Adam optimizer (it can be canceled set Adam_epochs=0) RMSprop ,
-Adam_epochs = 0
+Adam_epochs = 20
 batch_size = 64
 # momentum , mass, vel bd,pressure bd, data, out_vel
 # pinn_w =[1,.2,20,1,20,0]
-pinn_w =[2,.2,20,1,20,0]
+pinn_w =[2,.02,20,1,500,0]
 
-lr_boundaries =[N_lhc/batch_size * 5, N_lhc/batch_size *15, N_lhc/batch_size *30,N_lhc/batch_size * 70,N_lhc/batch_size *300]
-values = [ 1e-2, 5e-3, 1e-3, 5e-4, 1e-4, 1e-4]
+lr_boundaries =[N_lhc/batch_size * 2, N_lhc/batch_size *5, N_lhc/batch_size *15,N_lhc/batch_size *50,N_lhc/batch_size *300]
+# lr_boundaries =[N_lhc/batch_size * 150, N_lhc/batch_size *500, N_lhc/batch_size *1500,N_lhc/batch_size *2000,N_lhc/batch_size *20010]
+
+values = [ 5e-2, 1e-2, 5e-3, 1e-3, 1e-4, 1e-4]
+
 learning_rate_fn = tf.keras.optimizers.schedules.PiecewiseConstantDecay(lr_boundaries, values)
 
 
@@ -145,11 +148,12 @@ logs.set_error_fn2(error2,'PINN_error')
 
 pinn = bib.PINN(Adam_optimizer, logs, Colocations_points, pinn_w, rho = 0.8, mu = 0.00004, Steady = True)
 pinn.Foward(layers,activation) # Create pinn.model
+# pinn.set_dynamic_weight(is_dynamic_weight = False)
 
 if use_trained_model_flag:
   pinn.model.load_weights(WEIGHTS_PATH)
   
-with tf.device('/GPU:5'):
+with tf.device('/GPU:4'):
   pinn.fit(BD_Xvel_train, BD_Yvel_train, BD_Xpre_train,BD_Ypre_train,
             Input_data_train,Output_data_train,Adam_epochs, batch_size)
 
@@ -167,12 +171,14 @@ def build_loss(log_frequency_LBFGS = 50):
     tf.print('LBFGS Interation = ', iteration ,'  loss = ', loss)
   return loss
 
+pinn.set_dynamic_weight(is_dynamic_weight = False)
 trainable_variables =  pinn.model.trainable_variables  # the network weights and biases
-with tf.device('/GPU:5'):
+
+with tf.device('/GPU:4'):
   bib.lbfgs_minimize(trainable_variables, build_loss,
                      LBFGS_options = bib.set_LBFGS_options(
                        num_correction_pairs=100, f_relative_tolerance=0, parallel_iterations = 1,
-                       tolerance=1e-6, max_iterations=15000, max_line_search_iterations=50 ))
+                       tolerance=1e-8, max_iterations=15000, max_line_search_iterations=50 ))
 
 print('Final error = ', error())
 # logs.save(LOGS_FILE) #save csv file of loss and error
@@ -189,5 +195,4 @@ if save_weights_flag:
 X_train = np.vstack([BD_Xvel_train,BD_Xpre_train,Input_data_train])
 My_data.plot1(Input_star, u_pred.numpy(), X_train,Input_data_train,
              Real_output, X[:,:,0], Y[:,:,0],  x, y)
-
 
