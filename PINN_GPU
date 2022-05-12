@@ -30,7 +30,9 @@ class PINN(object):
     if not self.steady:
       self.X_pinn_train_t = self.X_pinn_train[:, 2:3]
     self.X_outside = tf.convert_to_tensor([], dtype=self.dtype)
-
+    self.set_dynamic_weight()
+    
+    
   def Foward(self,layers,activation):
     # Keras model, defined by layers
     self.model = tf.keras.Sequential()
@@ -204,8 +206,45 @@ class PINN(object):
     # l4 = tf.math.scalar_mul(self.pinn_w[3],tf.reduce_mean(tf.square(loss_bd_pre)))
     # l5 = tf.math.scalar_mul(self.pinn_w[4],tf.reduce_mean(tf.square(loss_data)))
     # l6 = tf.math.scalar_mul(self.pinn_w[5],tf.reduce_mean(tf.square(loss_out_vel)))
+    
+    #dynamic weights
+    if self.is_dynamic_weight:
+      # calculate loss and losses
+      
+      self.lossmemory_dt.assign(self.EMA( (l5) , self.lossmemory_dt, self.EMA_decay))
+      self.lossmemory_bd.assign(self.EMA( (l3+l4+l6) , self.lossmemory_bd, self.EMA_decay))
 
-    return l1+l2+l3+l4+l5+l6, [l1, l2, l3, l4 ,l5, l6]
+      # tf.print('teste',self.inter_count,'lossmemory_dt',self.lossmemory_dt,'alpha', self.alpha,'loss =',
+      #           self.alpha * (l5),'*',self.beta * (l3+l4+l6),'*', l1+l2)
+      self.max_loss_eq.assign(tf.math.maximum(self.max_loss_eq, tf.math.abs(l1+l2)))
+      self.inter_count.assign_add(1) 
+        
+      if self.inter_count == self.weight_update:
+        self.alpha_star.assign(tf.math.divide(self.max_loss_eq,
+                                             self.lossmemory_dt))
+        self.beta_star.assign(tf.math.divide(self.max_loss_eq,
+                                             self.lossmemory_bd))
+        tf.print('max_loss_eq = ', self.max_loss_eq)
+        
+        self.alpha.assign(self.EMA(self.alpha_star,self.alpha,self.w_decay))
+        self.beta.assign(self.EMA(self.beta_star,self.beta,self.w_decay))
+
+        self.inter_count.assign(0)
+        self.max_loss_eq.assign(0)
+       
+      loss = (l1+l2) + self.beta * (l3+l4+l6) + self.alpha * l5
+      losses = [l1, l2, l3, l4 ,l5, l6]
+    else:
+      loss = l1+l2+l3+l4+l5+l6
+      losses = [l1, l2, l3, l4 ,l5, l6]
+           
+    return loss, losses
+  
+  @tf.function
+  def EMA(self,new,previous,decay):
+    return (1-decay)*previous + decay*new
+  
+
 
   # Models of PINN loss
   @tf.function
@@ -256,7 +295,7 @@ class PINN(object):
     loss_mass = u_x + v_y
     return (loss_x + loss_y), loss_mass
 
-  # @tf.function
+  @tf.function
   def summary(self):
     return self.model.summary()
 
@@ -278,7 +317,8 @@ class PINN(object):
     y_batch = tf.convert_to_tensor([], dtype=self.dtype)
     t_batch = tf.convert_to_tensor([], dtype=self.dtype)
     loss_value = tf.convert_to_tensor([], dtype=self.dtype)
-
+    self.inter_count = tf.Variable(0, trainable=False, dtype=tf.int32)
+    
     for epoch in range(tf_epochs):
       # batch step
       train_batchs = train_dataset.shuffle(self.X_pinn_train.shape[0],reshuffle_each_iteration = True).batch(batch_size).enumerate()
@@ -319,6 +359,23 @@ class PINN(object):
   
   def set_outside_points(self,points):
     self.X_outside =tf.convert_to_tensor(points, dtype=self.dtype)
+    return
+  
+  def set_dynamic_weight(self,is_dynamic_weight = True, w_decay = 0.1, weight_update_step = 200,
+                         start = 1, EMA_decay = 0.004):
+    self.w_decay = w_decay
+    self.EMA_decay = EMA_decay
+    self.is_dynamic_weight = is_dynamic_weight
+    self.weight_update = weight_update_step
+    
+    self.lossmemory_dt = tf.Variable(0,trainable=False, dtype=self.dtype)
+    self.lossmemory_bd= tf.Variable(0,trainable=False, dtype=self.dtype)
+    
+    self.alpha_star  = tf.Variable(0,trainable=False, dtype=self.dtype)
+    self.beta_star  = tf.Variable(0,trainable=False, dtype=self.dtype)
+    self.alpha  = tf.Variable(start,trainable=False, dtype=self.dtype)
+    self.beta  = tf.Variable(start,trainable=False, dtype=self.dtype)
+    self.max_loss_eq  = tf.Variable(0,trainable=False, dtype=self.dtype)
     return
 
 class Logs(object):
@@ -381,9 +438,8 @@ class Logs(object):
     np.savetxt(path_name,np.concatenate((np.array(self.loss),error),axis=1), delimiter=",")
 
 
-"""TensorFlow interface for TensorFlow Probability optimizers."""
+"""TensorFlow interface for TensorFlow Probability optimizers including lbfgs_minimize."""
 import tensorflow_probability as tfp
-
 
 class LossAndFlatGradient:
     """A helper class to create a function required by tfp.optimizer.lbfgs_minimize.
