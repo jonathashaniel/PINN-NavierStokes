@@ -106,7 +106,7 @@ WEIGHTS_PATH ='.\save\last_weights'
 
 save_weights_flag = True
 use_trained_model_flag = False
-log_frequency_epoch = 1
+log_frequency_epoch = 10
 log_frequency_batch = 10
 
 # PIdeepNN topology (3-sized input [x y t], 9 hidden layer of 128-width, 3-sized output [u,v,p]
@@ -122,16 +122,40 @@ layers = [2, nodes,nodes,nodes,nodes,nodes,nodes, 3]
 
 activation=tf.nn.silu
 # Setting up the TF Adam optimizer (it can be canceled set Adam_epochs=0) RMSprop ,
-Adam_epochs = 20
-batch_size = 64
+Adam_epochs = 2000
+batch_size = N_lhc #64
+
+"""  *  pinn_w  =>  weight for each part separately.
+order:
+# momentum , mass, vel bd,pressure bd, data, out_vel
+
+- only one that works if dynamic weight is off (is_dynamic_weight = False)
+- 'influence the loss within each term, 
+for example increasing the relevance of the loss by the mass conservation equation 
+in relation of momentum conservation equation'
+
+      *term_weights =>  weight for each term
+order:
+      [equations, boundary conditions, data]
+terms are created by combining the parts:
+  equation:  mass + momentum
+  boundary:  vel bd + pressure bd + out_vel
+  data:  data
+  
+- influences only if dynamic weight is on (is_dynamic_weight = True)
+- 'can increase the relevance of one term o opmization search'  
+"""
+
 # momentum , mass, vel bd,pressure bd, data, out_vel
 # pinn_w =[1,.2,20,1,20,0]
-pinn_w =[2,.02,20,1,500,0]
+pinn_w =[2,.02,20,1,50,0]
+# equations, boundary conditions, data
+term_weights = [1,1,1]
 
-lr_boundaries =[N_lhc/batch_size * 2, N_lhc/batch_size *5, N_lhc/batch_size *15,N_lhc/batch_size *50,N_lhc/batch_size *300]
-# lr_boundaries =[N_lhc/batch_size * 150, N_lhc/batch_size *500, N_lhc/batch_size *1500,N_lhc/batch_size *2000,N_lhc/batch_size *20010]
+lr_boundaries =[N_lhc/batch_size * 10, N_lhc/batch_size *20, N_lhc/batch_size *30,N_lhc/batch_size *50,N_lhc/batch_size *300]
+lr_boundaries =[N_lhc/batch_size * 150, N_lhc/batch_size *500, N_lhc/batch_size *1300,N_lhc/batch_size *1800,N_lhc/batch_size *2300]
 
-values = [ 5e-2, 1e-2, 5e-3, 1e-3, 1e-4, 1e-4]
+values = [ 5e-2, 1e-2, 5e-3, 1e-3, 1e-3, 1e-4]
 
 learning_rate_fn = tf.keras.optimizers.schedules.PiecewiseConstantDecay(lr_boundaries, values)
 
@@ -146,42 +170,55 @@ logs = bib.Logs(log_frequency_epoch,log_frequency_batch)
 logs.set_error_fn(error)
 logs.set_error_fn2(error2,'PINN_error')
 
-pinn = bib.PINN(Adam_optimizer, logs, Colocations_points, pinn_w, rho = 0.8, mu = 0.00004, Steady = True)
+pinn = bib.PINN(Adam_optimizer, logs, Colocations_points, rho = 0.8, mu = 0.00004, Steady = True)
 pinn.Foward(layers,activation) # Create pinn.model
-# pinn.set_dynamic_weight(is_dynamic_weight = False)
 
 if use_trained_model_flag:
   pinn.model.load_weights(WEIGHTS_PATH)
+
+
+
+## INITIALIZATION  
+pinn.update_dynamic_weight([0,0,2,1,100,0], is_dynamic_weight = False)
+with tf.device('/GPU:4'):
+  pinn.fit(BD_Xvel_train, BD_Yvel_train, BD_Xpre_train,BD_Ypre_train,
+            Input_data_train,Output_data_train, 8 , 64)
   
+  
+##  ADAM TRAINING
+pinn.update_dynamic_weight(pinn_w, True, term_weights)
 with tf.device('/GPU:4'):
   pinn.fit(BD_Xvel_train, BD_Yvel_train, BD_Xpre_train,BD_Ypre_train,
             Input_data_train,Output_data_train,Adam_epochs, batch_size)
 
-###  L-BFGS traing
-iteration = tf.Variable(0)
-def build_loss(log_frequency_LBFGS = 50):
 
-  # loss Function from PINN
-  loss , _ = pinn.f_loss(pinn.X_pinn_train_x, pinn.X_pinn_train_y, pinn.X_pinn_train_t, 
-             pinn.X_bd_vel, pinn.Y_bd_vel,
-             pinn.X_bd_pre, pinn.Y_bd_pre,
-             pinn.X_data,pinn.Y_data)
-  iteration.assign_add(1)
-  if tf.math.floormod(iteration, log_frequency_LBFGS) == 0:
-    tf.print('LBFGS Interation = ', iteration ,'  loss = ', loss)
-  return loss
+##  L-BFGS traning
 
-pinn.set_dynamic_weight(is_dynamic_weight = False)
-trainable_variables =  pinn.model.trainable_variables  # the network weights and biases
+# iteration = tf.Variable(0)
+# def build_loss(log_frequency_LBFGS = 50):
 
-with tf.device('/GPU:4'):
-  bib.lbfgs_minimize(trainable_variables, build_loss,
-                     LBFGS_options = bib.set_LBFGS_options(
-                       num_correction_pairs=100, f_relative_tolerance=0, parallel_iterations = 1,
-                       tolerance=1e-8, max_iterations=15000, max_line_search_iterations=50 ))
+#   # loss Function from PINN
+#   loss , _ = pinn.f_loss(pinn.X_pinn_train_x, pinn.X_pinn_train_y, pinn.X_pinn_train_t, 
+#              pinn.X_bd_vel, pinn.Y_bd_vel,
+#              pinn.X_bd_pre, pinn.Y_bd_pre,
+#              pinn.X_data,pinn.Y_data)
+#   iteration.assign_add(1)
+#   if tf.math.floormod(iteration, log_frequency_LBFGS) == 0:
+#     tf.print('LBFGS Interation = ', iteration ,'  loss = ', loss)
+#   return loss
+
+# pinn.update_dynamic_weight(is_dynamic_weight = False)
+# ## set pinn_w = [1,1,1,1,1,1]
+# trainable_variables =  pinn.model.trainable_variables  # the network weights and biases
+
+# with tf.device('/GPU:4'):
+#   bib.lbfgs_minimize(trainable_variables, build_loss,
+#                      LBFGS_options = bib.set_LBFGS_options(
+#                        num_correction_pairs=100, f_relative_tolerance=0, parallel_iterations = 1,
+#                        tolerance=1e-8, max_iterations=1500, max_line_search_iterations=50 ))
 
 print('Final error = ', error())
-# logs.save(LOGS_FILE) #save csv file of loss and error
+logs.save(LOGS_FILE) #save csv file of loss and error
 
 # Getting the model predictions, from the same (x,y,t) that the predictions were previously gotten from
 u_pred = pinn.predict(Input_star)
