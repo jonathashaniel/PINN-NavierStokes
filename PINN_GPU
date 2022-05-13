@@ -15,14 +15,13 @@ from datetime import datetime
 
 
 class PINN(object):
-  def __init__(self, optimizer, logger, X_f,pinn_w = [1,1,1,1,1,1], rho = 1, mu = 0.0001, Steady = False):
+  def __init__(self, optimizer, logger, X_f, rho = 1, mu = 0.0001, Steady = False):
     self.mu = mu
     self.rho = rho
     self.optimizer = optimizer
     self.logger = logger
     self.dtype = tf.float32
     self.steady  = Steady
-    self.pinn_w = pinn_w #tf.constant(pinn_w, dtype=self.dtype)
     self.X_pinn_train = tf.convert_to_tensor(X_f, dtype=self.dtype)
     self.X_pinn_train_x = self.X_pinn_train[:, 0:1]
     self.X_pinn_train_y = self.X_pinn_train[:, 1:2]
@@ -30,6 +29,7 @@ class PINN(object):
     if not self.steady:
       self.X_pinn_train_t = self.X_pinn_train[:, 2:3]
     self.X_outside = tf.convert_to_tensor([], dtype=self.dtype)
+    
     self.set_dynamic_weight()
     
     
@@ -214,8 +214,9 @@ class PINN(object):
       self.lossmemory_dt.assign(self.EMA( (l5) , self.lossmemory_dt, self.EMA_decay))
       self.lossmemory_bd.assign(self.EMA( (l3+l4+l6) , self.lossmemory_bd, self.EMA_decay))
 
-      # tf.print('teste',self.inter_count,'lossmemory_dt',self.lossmemory_dt,'alpha', self.alpha,'loss =',
-      #           self.alpha * (l5),'*',self.beta * (l3+l4+l6),'*', l1+l2)
+      tf.print('teste',self.inter_count,'lossmemory_dt',self.lossmemory_dt,'alpha', self.alpha,'loss d,bd,eq =',
+                self.term_weights[2]*self.alpha * (l5),'*',self.term_weights[1]*self.beta * (l3+l4+l6),
+                '*', self.term_weights[0]*l1+l2)
       self.max_loss_eq.assign(tf.math.maximum(self.max_loss_eq, tf.math.abs(l1+l2)))
       self.inter_count.assign_add(1) 
         
@@ -230,9 +231,11 @@ class PINN(object):
         self.beta.assign(self.EMA(self.beta_star,self.beta,self.w_decay))
 
         self.inter_count.assign(0)
-        self.max_loss_eq.assign(0)
+        # self.max_loss_eq.assign(0) #last change contra 5.0858e-02  
        
-      loss = (l1+l2) + self.beta * (l3+l4+l6) + self.alpha * l5
+      loss = self.term_weights[0]*(l1+l2) + \
+        self.term_weights[1] * self.beta * (l3+l4+l6) +\
+          self.term_weights[2] * self.alpha * l5
       losses = [l1, l2, l3, l4 ,l5, l6]
     else:
       loss = l1+l2+l3+l4+l5+l6
@@ -317,8 +320,7 @@ class PINN(object):
     y_batch = tf.convert_to_tensor([], dtype=self.dtype)
     t_batch = tf.convert_to_tensor([], dtype=self.dtype)
     loss_value = tf.convert_to_tensor([], dtype=self.dtype)
-    self.inter_count = tf.Variable(0, trainable=False, dtype=tf.int32)
-    
+       
     for epoch in range(tf_epochs):
       # batch step
       train_batchs = train_dataset.shuffle(self.X_pinn_train.shape[0],reshuffle_each_iteration = True).batch(batch_size).enumerate()
@@ -360,23 +362,67 @@ class PINN(object):
   def set_outside_points(self,points):
     self.X_outside =tf.convert_to_tensor(points, dtype=self.dtype)
     return
-  
-  def set_dynamic_weight(self,is_dynamic_weight = True, w_decay = 0.1, weight_update_step = 200,
-                         start = 1, EMA_decay = 0.004):
-    self.w_decay = w_decay
-    self.EMA_decay = EMA_decay
-    self.is_dynamic_weight = is_dynamic_weight
-    self.weight_update = weight_update_step
+  def set_dynamic_weight(self,pinn_w = [1,1,1,1,1,1], is_dynamic_weight = True, term_weights = [1,1,1],
+                         w_decay = 0.1, weight_update_step = 200, start = 1, EMA_decay = 0.04):
     
+    """  *  pinn_w  =>  weight for each part separately.
+    order:[momentum , mass, vel bd,pressure bd, data, out_vel]
+    
+    - only one that works if dynamic weight is off (is_dynamic_weight = False)
+    - 'influence the loss within each term, 
+    for example increasing the relevance of the loss by the mass conservation equation 
+    in relation of momentum conservation equation'
+    
+          *term_weights =>  weight for each term
+    order: [equations, boundary conditions, data]
+    terms are created by combining the parts:
+      equation:  mass + momentum
+      boundary:  vel bd + pressure bd + out_vel
+      data:  data
+      
+    - influences only if dynamic weight is on (is_dynamic_weight = True)
+    - 'can increase the relevance of one term o opmization search'  
+    
+    * w_decay -> moving average decay to update alpha and beta
+    * weight_update_step -> frequency of update alpha and beta
+    * start-> initial value of alpha and beta
+    * EMA_decay -> decay of exponential moving average that store the average of loss_bd and loss_data
+    """
+    
+    self.pinn_w = tf.Variable(pinn_w, trainable = False, dtype=self.dtype)
+    self.term_weights = tf.Variable(term_weights, trainable = False, dtype=self.dtype)
+    self.w_decay = tf.Variable(w_decay, trainable = False)
+    self.EMA_decay = tf.Variable(EMA_decay, trainable = False)
+    self.is_dynamic_weight = tf.Variable(is_dynamic_weight, trainable = False, dtype = tf.bool)
+    self.weight_update = tf.Variable(weight_update_step, trainable = False,dtype=tf.int16)
     self.lossmemory_dt = tf.Variable(0,trainable=False, dtype=self.dtype)
     self.lossmemory_bd= tf.Variable(0,trainable=False, dtype=self.dtype)
-    
     self.alpha_star  = tf.Variable(0,trainable=False, dtype=self.dtype)
     self.beta_star  = tf.Variable(0,trainable=False, dtype=self.dtype)
     self.alpha  = tf.Variable(start,trainable=False, dtype=self.dtype)
     self.beta  = tf.Variable(start,trainable=False, dtype=self.dtype)
     self.max_loss_eq  = tf.Variable(0,trainable=False, dtype=self.dtype)
+    self.inter_count = tf.Variable(0, trainable=False, dtype= tf.int16)
     return
+  
+  def update_dynamic_weight(self,pinn_w = [1,1,1,1,1,1], is_dynamic_weight = True, term_weights = [1,1,1],
+                            w_decay = 0.1, weight_update_step = 200, start = 1, EMA_decay = 0.4):
+    
+    self.pinn_w.assign(pinn_w)
+    self.term_weights.assign(term_weights)
+    self.w_decay.assign(w_decay)
+    self.EMA_decay.assign(EMA_decay)
+    self.is_dynamic_weight.assign(is_dynamic_weight)
+    self.weight_update.assign(weight_update_step)
+    self.lossmemory_dt.assign(0)
+    self.lossmemory_bd.assign(0)
+    self.alpha_star.assign(0)
+    self.beta_star.assign(0)
+    self.alpha.assign(start)
+    self.beta.assign(start)
+    self.max_loss_eq.assign(0)
+    self.inter_count.assign(0)
+    
 
 class Logs(object):
   def __init__(self, frequency_epoch=10,frequency_batch=10):
