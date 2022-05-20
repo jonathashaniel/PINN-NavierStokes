@@ -32,7 +32,6 @@ class PINN(object):
     
     self.set_dynamic_weight()
     
-    
   def Foward(self,layers,activation):
     # Keras model, defined by layers
     self.model = tf.keras.Sequential()
@@ -192,20 +191,29 @@ class PINN(object):
       loss_data = tf.constant(0, dtype = self.dtype)
     # calculate loss by Navier-Stokes
     loss_momentum, loss_mass = self.f_loss_PINN(x_batch, y_batch, t_batch)
+# error =  0.07275202
+    # l1 = tf.math.scalar_mul(self.pinn_w[0],tf.reduce_mean(tf.math.log(tf.math.cosh(loss_momentum))))
+    # l2 = tf.math.scalar_mul(self.pinn_w[1],tf.reduce_mean(tf.math.log(tf.math.cosh(loss_mass))))
+    # l3 = tf.math.scalar_mul(self.pinn_w[2],tf.reduce_mean(tf.math.abs(loss_bd_vel)))
+    # l4 = tf.math.scalar_mul(self.pinn_w[3],tf.reduce_mean(tf.math.abs(loss_bd_pre)))
+    # l5 = tf.math.scalar_mul(self.pinn_w[4],tf.reduce_mean(tf.math.abs(loss_data)))
+    # l6 = tf.math.scalar_mul(self.pinn_w[5],tf.reduce_mean(tf.math.abs(loss_out_vel)))
 
-    l1 = tf.math.scalar_mul(self.pinn_w[0],tf.reduce_mean(tf.math.log(tf.math.cosh(loss_momentum))))
-    l2 = tf.math.scalar_mul(self.pinn_w[1],tf.reduce_mean(tf.math.log(tf.math.cosh(loss_mass))))
-    l3 = tf.math.scalar_mul(self.pinn_w[2],tf.reduce_mean(tf.math.abs(loss_bd_vel)))
-    l4 = tf.math.scalar_mul(self.pinn_w[3],tf.reduce_mean(tf.math.abs(loss_bd_pre)))
-    l5 = tf.math.scalar_mul(self.pinn_w[4],tf.reduce_mean(tf.math.abs(loss_data)))
-    l6 = tf.math.scalar_mul(self.pinn_w[5],tf.reduce_mean(tf.math.abs(loss_out_vel)))
-
-    # l1 = tf.math.scalar_mul(self.pinn_w[0],tf.reduce_mean(tf.square(loss_momentum)))
-    # l2 = tf.math.scalar_mul(self.pinn_w[1],tf.reduce_mean(tf.square(loss_mass)))
-    # l3 = tf.math.scalar_mul(self.pinn_w[2],tf.reduce_mean(tf.square(loss_bd_vel)))
-    # l4 = tf.math.scalar_mul(self.pinn_w[3],tf.reduce_mean(tf.square(loss_bd_pre)))
-    # l5 = tf.math.scalar_mul(self.pinn_w[4],tf.reduce_mean(tf.square(loss_data)))
-    # l6 = tf.math.scalar_mul(self.pinn_w[5],tf.reduce_mean(tf.square(loss_out_vel)))
+# error =  0.035430223
+    l1 = tf.math.scalar_mul(self.pinn_w[0],tf.reduce_mean(tf.square(loss_momentum)))
+    l2 = tf.math.scalar_mul(self.pinn_w[1],tf.reduce_mean(tf.square(loss_mass)))
+    l3 = tf.math.scalar_mul(self.pinn_w[2],tf.reduce_mean(tf.square(loss_bd_vel)))
+    l4 = tf.math.scalar_mul(self.pinn_w[3],tf.reduce_mean(tf.square(loss_bd_pre)))
+    l5 = tf.math.scalar_mul(self.pinn_w[4],tf.reduce_mean(tf.square(loss_data)))
+    l6 = tf.math.scalar_mul(self.pinn_w[5],tf.reduce_mean(tf.square(loss_out_vel)))
+    
+# error =  0.035099596    
+    # l1 = tf.math.scalar_mul(self.pinn_w[0],tf.reduce_mean(tf.math.log(tf.math.cosh(loss_momentum))))
+    # l2 = tf.math.scalar_mul(self.pinn_w[1],tf.reduce_mean(tf.math.log(tf.math.cosh(loss_mass))))
+    # l3 = tf.math.scalar_mul(self.pinn_w[2],tf.reduce_mean(tf.math.square(loss_bd_vel)))
+    # l4 = tf.math.scalar_mul(self.pinn_w[3],tf.reduce_mean(tf.math.square(loss_bd_pre)))
+    # l5 = tf.math.scalar_mul(self.pinn_w[4],tf.reduce_mean(tf.math.square(loss_data)))
+    # l6 = tf.math.scalar_mul(self.pinn_w[5],tf.reduce_mean(tf.math.square(loss_out_vel)))
     
     #dynamic weights
     if self.is_dynamic_weight:
@@ -214,9 +222,9 @@ class PINN(object):
       self.lossmemory_dt.assign(self.EMA( (l5) , self.lossmemory_dt, self.EMA_decay))
       self.lossmemory_bd.assign(self.EMA( (l3+l4+l6) , self.lossmemory_bd, self.EMA_decay))
 
-      tf.print('teste',self.inter_count,'lossmemory_dt',self.lossmemory_dt,'alpha', self.alpha,'loss d,bd,eq =',
-                self.term_weights[2]*self.alpha * (l5),'*',self.term_weights[1]*self.beta * (l3+l4+l6),
-                '*', self.term_weights[0]*l1+l2)
+      # tf.print('teste',self.inter_count,'lossmemory_dt',self.lossmemory_dt,'alpha', self.alpha,'loss d,bd,eq =',
+      #           self.term_weights[2]*self.alpha * (l5),'*',self.term_weights[1]*self.beta * (l3+l4+l6),
+      #           '*', self.term_weights[0]*l1+l2)
       self.max_loss_eq.assign(tf.math.maximum(self.max_loss_eq, tf.math.abs(l1+l2)))
       self.inter_count.assign_add(1) 
         
@@ -231,9 +239,9 @@ class PINN(object):
         self.beta.assign(self.EMA(self.beta_star,self.beta,self.w_decay))
 
         self.inter_count.assign(0)
-        # self.max_loss_eq.assign(0) #last change contra 5.0858e-02  
+        self.max_loss_eq.assign(0) 
        
-      loss = self.term_weights[0]*(l1+l2) + \
+      loss = self.term_weights[0] * (l1+l2) + \
         self.term_weights[1] * self.beta * (l3+l4+l6) +\
           self.term_weights[2] * self.alpha * l5
       losses = [l1, l2, l3, l4 ,l5, l6]
@@ -604,11 +612,11 @@ def lbfgs_minimize(trainable_variables, build_loss,
     initial_position = None
     if previous_optimizer_results is None:
         initial_position = func.to_flat_weights(trainable_variables)
-    results = tfp.optimizer.lbfgs_minimize(
+    results = tfp.optimizer.bfgs_minimize(
         func,
         initial_position=initial_position,
-        previous_optimizer_results=previous_optimizer_results,
-        num_correction_pairs=LBFGS_options["maxcor"],
+        # previous_optimizer_results=previous_optimizer_results,
+        # num_correction_pairs=LBFGS_options["maxcor"],
         tolerance=LBFGS_options["gtol"],
         x_tolerance=0,
         f_relative_tolerance=LBFGS_options["ftol"],
