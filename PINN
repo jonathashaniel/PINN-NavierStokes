@@ -153,14 +153,14 @@ class PINN(object):
     
     ##this double gradient tape make everything slow to compile 
     with tf.GradientTape() as tape:
-      # if self.dynamic_weight_method == 'LR_annealing':
-      #   loss_value,losses = self.LR_Annealing(x_batch, y_batch, t_batch,
-      #                                   X_bd_vel, Y_bd_vel,X_bd_pre, 
-      #                                   Y_bd_pre,X_data,Y_data)
-      # else:            
-      loss_value,losses = self.f_loss(x_batch, y_batch, t_batch,
-                                      X_bd_vel, Y_bd_vel,X_bd_pre, 
-                                      Y_bd_pre,X_data,Y_data)
+      if self.dynamic_weight_method == 'LR_annealing':
+        loss_value,losses = self.LR_Annealing(x_batch, y_batch, t_batch,
+                                        X_bd_vel, Y_bd_vel,X_bd_pre, 
+                                        Y_bd_pre,X_data,Y_data)
+      else:            
+        loss_value,losses = self.f_loss(x_batch, y_batch, t_batch,
+                                        X_bd_vel, Y_bd_vel,X_bd_pre, 
+                                        Y_bd_pre,X_data,Y_data)
     return loss_value, tape.gradient(loss_value, self.model.trainable_variables), losses
 
   # Defining custom loss
