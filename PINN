@@ -7,8 +7,10 @@ Created on Tue May 18 16:24:58 2021
 PINN with navier-stokes loss functions
 
 using tensorflow 2.5.0
+using tf_siren for tf2.0 -> pip install --upgrade tf_siren
 """
 import tensorflow as tf
+from tf_siren import SinusodialRepresentationDense
 import numpy as np
 import time
 from datetime import datetime
@@ -29,8 +31,9 @@ class PINN(object):
     if not self.steady:
       self.X_pinn_train_t = self.X_pinn_train[:, 2:3]
     self.X_outside = tf.convert_to_tensor([], dtype=self.dtype)
+    self.losses = tf.Variable([0,0,0,0,0,0], trainable=False, dtype=self.dtype)
     
-    self.set_dynamic_weight()
+    self.start_dynamic_weight()
     
   def Foward(self,layers,activation):
     # Keras model, defined by layers
@@ -48,6 +51,19 @@ class PINN(object):
         self.model.add(tf.keras.layers.Dense(
             width, activation=activation,
             kernel_initializer='glorot_normal'))
+        
+  def Foward_Siren(self,layers,activation):
+    # Keras model, using Siren activation: https://github.com/titu1994/tf_SIREN
+    input = tf.keras.Input(shape=(layers[0],), name='input (x,y,t)')
+    u = 0
+    for width in layers[1:-1]:
+      if  u <  1:
+        x = input
+      u += 1
+      x = SinusodialRepresentationDense(width,activation='sine',w0=1.0)(x)
+    output = tf.keras.layers.Dense(layers[-1], activation=activation,
+                              kernel_initializer='glorot_normal')(x)
+    self.model = tf.keras.Model(inputs=[input], outputs=[output])
 
   def Multi_channel_foward(self,layers,activation):
     input = tf.keras.Input(shape=(layers[0][0],), dtype=self.dtype, name='input (x,y,t)')
@@ -148,29 +164,38 @@ class PINN(object):
     
   # calculate loss gradients to update weights and bias
   @tf.function
-  def f_grad(self, x_batch, y_batch, t_batch, X_bd_vel, Y_bd_vel,
-             X_bd_pre, Y_bd_pre,X_data,Y_data):
+  def f_grad(self):
     
     ##this double gradient tape make everything slow to compile 
     with tf.GradientTape() as tape:
       if self.dynamic_weight_method == 'LR_annealing':
-        loss_value,losses = self.LR_Annealing(x_batch, y_batch, t_batch,
-                                        X_bd_vel, Y_bd_vel,X_bd_pre, 
-                                        Y_bd_pre,X_data,Y_data)
+        loss_value = self.LR_Annealing()
       else:            
-        loss_value,losses = self.f_loss(x_batch, y_batch, t_batch,
-                                        X_bd_vel, Y_bd_vel,X_bd_pre, 
-                                        Y_bd_pre,X_data,Y_data)
-    return loss_value, tape.gradient(loss_value, self.model.trainable_variables), losses
+        loss_value = self.f_loss()
+    return loss_value, tape.gradient(loss_value, self.model.trainable_variables)
 
   # Defining custom loss
   @tf.function
-  def f_loss(self, x_batch, y_batch, t_batch, 
-             X_bd_velocity, Y_bd_velocity, X_bd_pressure,Y_bd_pressure, X_data,Y_data):
+  def f_loss(self):
+    
+    losses = self.Calculate_separate_losses()
+    #dynamic weights
+    if self.dynamic_weight_method == 'balance':
+      loss = self.DW_balance(losses)
+    
+    elif self.dynamic_weight_method == 'relobralo':
+      loss = self.DW_ReLoBRaLo(losses)
+      
+    else:
+      loss = tf.reduce_sum(losses)
+      
+    return loss
+  @tf.function
+  def Calculate_separate_losses(self):
     # verify and calculate loss data and/or boundary
-    if Y_bd_velocity.shape[0]>0:
-      loss_bd_vel = Y_bd_velocity - \
-        tf.cast(self.model(X_bd_velocity,training=True)[:, 0:2], self.dtype)
+    if self.Y_bd_vel.shape[0]>0:
+      loss_bd_vel = self.Y_bd_vel - \
+        tf.cast(self.model(self.X_bd_vel,training=True)[:, 0:2], self.dtype)
     else:
       loss_bd_vel =tf.constant(0, dtype = self.dtype)
     if self.X_outside.shape[0] > 0:
@@ -178,21 +203,21 @@ class PINN(object):
     else:
       loss_out_vel =tf.constant(0, dtype = self.dtype)
     
-    if Y_bd_pressure.shape[0]>0:
-      loss_bd_pre = Y_bd_pressure - \
-        tf.cast(self.model(X_bd_pressure,training=True)[:, 2:3], self.dtype)
+    if self.Y_bd_pre.shape[0]>0:
+      loss_bd_pre = self.Y_bd_pre - \
+        tf.cast(self.model(self.X_bd_pre,training=True)[:, 2:3], self.dtype)
     else:
       loss_bd_pre =tf.constant(0, dtype = self.dtype)
 
-    if Y_data.shape[0]>0:
-      if Y_data.shape[1]==3:
-        loss_data = Y_data - tf.cast(self.model(X_data,training=True), self.dtype)
-      elif Y_data.shape[1]==2:
-        loss_data = Y_data[:,0:2] - tf.cast(self.model(X_data,training=True), self.dtype)[:,0:2]
+    if self.Y_data.shape[0]>0:
+      if self.Y_data.shape[1]==3:
+        loss_data = self.Y_data - tf.cast(self.model(self.X_data,training=True), self.dtype)
+      elif self.Y_data.shape[1]==2:
+        loss_data = self.Y_data[:,0:2] - tf.cast(self.model(self.X_data,training=True), self.dtype)[:,0:2]
     else:
       loss_data = tf.constant(0, dtype = self.dtype)
     # calculate loss by Navier-Stokes
-    loss_momentum, loss_mass = self.f_loss_PINN(x_batch, y_batch, t_batch)
+    loss_momentum, loss_mass = self.f_loss_PINN()
 
 # error =  0.035430223
     l1 = tf.math.scalar_mul(self.pinn_w[0],tf.reduce_mean(tf.square(loss_momentum)))
@@ -209,29 +234,105 @@ class PINN(object):
     # l4 = tf.math.scalar_mul(self.pinn_w[3],tf.reduce_mean(tf.math.square(loss_bd_pre)))
     # l5 = tf.math.scalar_mul(self.pinn_w[4],tf.reduce_mean(tf.math.square(loss_data)))
     # l6 = tf.math.scalar_mul(self.pinn_w[5],tf.reduce_mean(tf.math.square(loss_out_vel)))
+    self.losses.assign([l1, l2, l3, l4 ,l5, l6])
     
-    #dynamic weights
-    if self.dynamic_weight_method == 'balance':
-      loss = self.DW_balance(l1,l2,l3,l4,l5,l6)
+    return [l1, l2, l3, l4 ,l5, l6]
+  
+  # Models of PINN loss
+  @tf.function
+  def f_loss_PINN(self):
+    # Using the new GradientTape paradigm of TF2.0,
+    # which keeps track of operations to get the gradient at runtime
+    with tf.GradientTape(persistent=True) as tape3:
+      tape3.watch(self.x_batch)
+      tape3.watch(self.y_batch)
+      
+      with tf.GradientTape(persistent=True) as tape4:
+        # Watching the three inputs we’ll need later, x , y and t
+        tape4.watch(self.x_batch)
+        tape4.watch(self.y_batch)
+        if not self.steady:
+          tape4.watch(self.t_batch)
+          X_f = tf.stack([self.x_batch[:,0], self.y_batch[:,0], self.t_batch[:,0]], axis=1)
+        else:
+          # Packing together the inputs
+          X_f = tf.stack([self.x_batch[:,0], self.y_batch[:,0]], axis=1)
+  
+        # Getting the prediction
+        Pred =  tf.cast(self.model(X_f,training=True), self.dtype)
+        u = tf.slice(Pred,[0,0],[-1,1])
+        v = tf.slice(Pred,[0,1],[-1,1])
+        p = tf.slice(Pred,[0,2],[-1,1])
+   
+      u_x = tape4.gradient(u, self.x_batch)
+      v_x = tape4.gradient(v, self.x_batch)
+      u_y = tape4.gradient(u, self.y_batch)
+      v_y = tape4.gradient(v, self.y_batch)
+      if not self.steady:
+        u_t = tape4.gradient(u, self.t_batch)
+        v_t = tape4.gradient(v, self.t_batch)
+      else:
+        u_t = 0
+        v_t = 0
     
-    elif self.dynamic_weight_method == 'relobralo':
-      loss = self.DW_ReLoBRaLo(l1,l2,l3,l4,l5,l6)
-      
-    else:
-      loss = l1+l2+l3+l4+l5+l6
-      
-    return loss, [l1, l2, l3, l4 ,l5, l6]
+    # Getting the other derivatives
+    u_xx = tape3.gradient(u_x, self.x_batch)
+    u_yy = tape3.gradient(u_y, self.y_batch)
+    v_xx = tape3.gradient(v_x, self.x_batch)
+    v_yy = tape3.gradient(v_y, self.y_batch)
+    p_x = tape3.gradient(p, self.x_batch)
+    p_y = tape3.gradient(p, self.y_batch)
+        
+    del tape3, tape4
+
+    # Buidling the PINNs
+    loss_x = self.rho * (u_t + u*u_x + v*u_y) + p_x - self.mu*(u_xx + u_yy )
+    loss_y = self.rho * (v_t + u*v_x + v*v_y) + p_y - self.mu*(v_xx + v_yy )
+    # loss_x = (u_t + u*u_x + v*u_y) + p_x - (1/RE)*(u_xx + u_yy )
+    # loss_y = (v_t + u*v_x + v*v_y) + p_y - (1/RE)*(v_xx + v_yy )
+    loss_mass = u_x + v_y
+    return (loss_x + loss_y), loss_mass
   
   @tf.function
-  def DW_balance(self,l1,l2,l3,l4,l5,l6):
+  def LR_Annealing(self):
+    
+    with tf.GradientTape(persistent=True) as tape2:
+      losses = self.Calculate_separate_losses()
+      loss_eq = losses[0]+losses[1]
+      loss_bd = losses[2]+losses[3]+losses[5]
+      loss_dt = losses[4]
+ 
+    grad_eq = tape2.gradient(loss_eq, self.model.trainable_variables, unconnected_gradients='zero')
+    grad_bd = tape2.gradient(loss_bd, self.model.trainable_variables, unconnected_gradients='zero')
+    grad_dt = tape2.gradient(loss_dt, self.model.trainable_variables, unconnected_gradients='zero')
+    del tape2
+    # tf.print('grad',grad_eq)
+    mean_grad_eq = tf.reduce_max(tf.abs(tf.concat([tf.reshape(g, (-1,)) for g in grad_eq], axis=-1)))
+    lambs_hat_bd = mean_grad_eq / (tf.reduce_mean(tf.abs(tf.concat([tf.reshape(g, (-1,)) for g in grad_bd], axis=-1)))+1e-12)
+    lambs_hat_dt = mean_grad_eq / (tf.reduce_mean(tf.abs(tf.concat([tf.reshape(g, (-1,)) for g in grad_dt], axis=-1)))+1e-12)
+    
+    if tf.reduce_sum(self.LR_alpha) ==0:
+      self.LR_alpha.assign(lambs_hat_dt)
+      self.LR_beta.assign(lambs_hat_bd)
+    
+    self.LR_alpha.assign(self.EMA(lambs_hat_dt,self.LR_alpha,self.LR_decay))
+    self.LR_beta.assign(self.EMA(lambs_hat_bd,self.LR_beta,self.LR_decay))
+  
+    loss = self.term_weights[0] * loss_eq + \
+           self.term_weights[1] * self.LR_beta * loss_bd +\
+           self.term_weights[2] * self.LR_alpha * loss_dt
+    return loss
+  
+  @tf.function
+  def DW_balance(self,losses):
     # calculate loss and losses
-    self.lossmemory_dt.assign(self.EMA( (l5) , self.lossmemory_dt, self.EMA_decay))
-    self.lossmemory_bd.assign(self.EMA( (l3+l4+l6) , self.lossmemory_bd, self.EMA_decay))
+    self.lossmemory_dt.assign(self.EMA( (losses[4]) , self.lossmemory_dt, self.EMA_decay))
+    self.lossmemory_bd.assign(self.EMA( (losses[2]+losses[3]+losses[5]) , self.lossmemory_bd, self.EMA_decay))
 
     # tf.print('teste',self.inter_count,'lossmemory_dt',self.lossmemory_dt,'alpha', self.alpha,'loss d,bd,eq =',
     #           self.term_weights[2]*self.alpha * (l5),'*',self.term_weights[1]*self.beta * (l3+l4+l6),
     #           '*', self.term_weights[0]*l1+l2)
-    self.max_loss_eq.assign(tf.math.maximum(self.max_loss_eq, tf.math.abs(l1+l2)))
+    self.max_loss_eq.assign(tf.math.maximum(self.max_loss_eq, tf.math.abs(losses[0]+losses[1])))
     self.inter_count.assign_add(1) 
       
     if self.inter_count == self.weight_update:
@@ -246,51 +347,30 @@ class PINN(object):
       self.inter_count.assign(0)
       self.max_loss_eq.assign(0) 
      
-    loss = self.term_weights[0] * (l1+l2) + \
-      self.term_weights[1] * self.beta * (l3+l4+l6) +\
-        self.term_weights[2] * self.alpha * l5
+    loss = self.term_weights[0] * (losses[0]+losses[1]) + \
+      self.term_weights[1] * self.beta * (losses[2]+losses[3]+losses[5]) +\
+        self.term_weights[2] * self.alpha * losses[4]
     return loss
   
   @tf.function
-  def LR_Annealing(self,x_batch, y_batch, t_batch,X_bd_vel, Y_bd_vel,X_bd_pre,Y_bd_pre,X_data,Y_data):
-    
-    with tf.GradientTape(persistent=True) as tape2:
-      _,losses = self.f_loss(x_batch, y_batch, t_batch,
-                                      X_bd_vel, Y_bd_vel,X_bd_pre, 
-                                      Y_bd_pre,X_data,Y_data)
-      loss_eq = losses[0]+losses[1]
-      loss_bd = losses[2]+losses[3]+losses[5]
-      loss_dt = losses[4]
- 
-    grad_eq = tape2.gradient(loss_eq, self.model.trainable_variables, unconnected_gradients='zero')
-    grad_bd = tape2.gradient(loss_bd, self.model.trainable_variables, unconnected_gradients='zero')
-    grad_dt = tape2.gradient(loss_dt, self.model.trainable_variables, unconnected_gradients='zero')
-    del tape2
-    # tf.print('grad',grad_eq)
-    mean_grad_eq = tf.reduce_max(tf.abs(tf.concat([tf.reshape(g, (-1,)) for g in grad_eq], axis=-1)))
-    lambs_hat_bd = mean_grad_eq / (tf.reduce_mean(tf.abs(tf.concat([tf.reshape(g, (-1,)) for g in grad_bd], axis=-1)))+1e-12)
-    lambs_hat_dt = mean_grad_eq / (tf.reduce_mean(tf.abs(tf.concat([tf.reshape(g, (-1,)) for g in grad_dt], axis=-1)))+1e-12)
-
-    self.LR_alpha.assign(self.EMA(lambs_hat_dt,self.LR_alpha,self.LR_decay))
-    self.LR_beta.assign(self.EMA(lambs_hat_bd,self.LR_beta,self.LR_decay))
-  
-    loss = self.term_weights[0] * loss_eq + \
-           self.term_weights[1] * self.LR_beta * loss_bd +\
-           self.term_weights[2] * self.LR_alpha * loss_dt
-    return loss, losses
-
-  @tf.function
-  def DW_ReLoBRaLo(self,l1,l2,l3,l4,l5,l6):
+  def DW_ReLoBRaLo(self,losses):
     saudade = tf.random.normal([1],mean=1,stddev=self.rho_std,dtype=self.dtype)
     saudade  = tf.math.minimum(tf.math.maximum(saudade[0],0),1)    
 
-    loss_eq = l1+l2
-    loss_bd = l3+l4+l6
-    loss_dt = l5
+    loss_eq = losses[0]+losses[1]
+    loss_bd = losses[2]+losses[3]+losses[5]
+    loss_dt = losses[4]
     losses = [loss_eq] + [loss_bd,loss_dt]
+    
+    if tf.reduce_sum(self.previus_loss) == 0:
+      self.previus_loss.assign(losses)
 
     lambs_hat = tf.stop_gradient(tf.nn.softmax([losses[i]/(self.previus_loss[i]*self.T+1e-12) for i in range(len(losses))])*tf.cast(len(losses), dtype=self.dtype))
     lambs0_hat = tf.stop_gradient(tf.nn.softmax([losses[i]/(self.lamb_0[i]*self.T+1e-12) for i in range(len(losses))])*tf.cast(len(losses), dtype=self.dtype))
+    
+    if tf.reduce_sum(self.previus_lamb) == 0:
+      self.previus_lamb.assign(lambs_hat)    
+    
     lambs = [saudade*self.alpha_decay*self.previus_lamb[i] + (1-saudade)*self.alpha_decay*lambs0_hat[i] + (1-self.alpha_decay)*lambs_hat[i] for i in range(len(losses))]
 
     loss = tf.reduce_sum([lambs[i]*losses[i]*self.term_weights[i] for i in range(len(losses))])
@@ -307,61 +387,6 @@ class PINN(object):
   @tf.function
   def EMA(self,new,previous,decay):
     return (1-decay)*previous + decay*new
-
-  # Models of PINN loss
-  @tf.function
-  def f_loss_PINN(self, x_batch, y_batch, t_batch):
-    # Using the new GradientTape paradigm of TF2.0,
-    # which keeps track of operations to get the gradient at runtime
-    with tf.GradientTape(persistent=True) as tape3:
-      tape3.watch(x_batch)
-      tape3.watch(y_batch)
-      
-      with tf.GradientTape(persistent=True) as tape4:
-        # Watching the three inputs we’ll need later, x , y and t
-        tape4.watch(x_batch)
-        tape4.watch(y_batch)
-        if not self.steady:
-          tape4.watch(t_batch)
-          X_f = tf.stack([x_batch[:,0], y_batch[:,0], t_batch[:,0]], axis=1)
-        else:
-          # Packing together the inputs
-          X_f = tf.stack([x_batch[:,0], y_batch[:,0]], axis=1)
-  
-        # Getting the prediction
-        Pred =  tf.cast(self.model(X_f,training=True), self.dtype)
-        u = tf.slice(Pred,[0,0],[-1,1])
-        v = tf.slice(Pred,[0,1],[-1,1])
-        p = tf.slice(Pred,[0,2],[-1,1])
-   
-      u_x = tape4.gradient(u, x_batch)
-      v_x = tape4.gradient(v, x_batch)
-      u_y = tape4.gradient(u, y_batch)
-      v_y = tape4.gradient(v, y_batch)
-      if not self.steady:
-        u_t = tape4.gradient(u, t_batch)
-        v_t = tape4.gradient(v, t_batch)
-      else:
-        u_t = 0
-        v_t = 0
-    
-    # Getting the other derivatives
-    u_xx = tape3.gradient(u_x, x_batch)
-    u_yy = tape3.gradient(u_y, y_batch)
-    v_xx = tape3.gradient(v_x, x_batch)
-    v_yy = tape3.gradient(v_y, y_batch)
-    p_x = tape3.gradient(p, x_batch)
-    p_y = tape3.gradient(p, y_batch)
-        
-    del tape3, tape4
-
-    # Buidling the PINNs
-    loss_x = self.rho * (u_t + u*u_x + v*u_y) + p_x - self.mu*(u_xx + u_yy )
-    loss_y = self.rho * (v_t + u*v_x + v*v_y) + p_y - self.mu*(v_xx + v_yy )
-    # loss_x = (u_t + u*u_x + v*u_y) + p_x - (1/RE)*(u_xx + u_yy )
-    # loss_y = (v_t + u*v_x + v*v_y) + p_y - (1/RE)*(v_xx + v_yy )
-    loss_mass = u_x + v_y
-    return (loss_x + loss_y), loss_mass
 
   @tf.function
   def summary(self):
@@ -381,42 +406,35 @@ class PINN(object):
     self.X_data = tf.convert_to_tensor(X_data, dtype=self.dtype)
     self.Y_data = tf.convert_to_tensor(Y_data, dtype=self.dtype)
     train_dataset =tf.data.Dataset.from_tensor_slices(self.X_pinn_train)
-    x_batch = tf.convert_to_tensor([], dtype=self.dtype)
-    y_batch = tf.convert_to_tensor([], dtype=self.dtype)
-    t_batch = tf.convert_to_tensor([], dtype=self.dtype)
-    loss_value = tf.convert_to_tensor([], dtype=self.dtype)
-       
+    self.x_batch = tf.Variable(tf.zeros(shape = [batch_size,1]), trainable=False, dtype=self.dtype)
+    self.y_batch = tf.Variable(tf.zeros(shape = [batch_size,1]), trainable=False, dtype=self.dtype)
+    self.t_batch = tf.Variable(tf.zeros(shape = [batch_size,1]), trainable=False, dtype=self.dtype)
+
     for epoch in range(tf_epochs):
       # batch step
       train_batchs = train_dataset.shuffle(self.X_pinn_train.shape[0],reshuffle_each_iteration = True).batch(batch_size).enumerate()
       for step, batch in train_batchs:
-        step = tf.constant(step)
         batch = tf.convert_to_tensor(batch, dtype=self.dtype)
-        x_batch = tf.convert_to_tensor(batch[:, 0:1], dtype=self.dtype)
-        y_batch = tf.convert_to_tensor(batch[:, 1:2], dtype=self.dtype)
+        self.x_batch[:batch.shape[0],].assign(batch[:, 0:1])
+        self.y_batch[:batch.shape[0],].assign(batch[:, 1:2])
         if not self.steady:
-          t_batch = tf.convert_to_tensor(batch[:, 2:3], dtype=self.dtype)
+          self.t_batch[:batch.shape[0],].assing(batch[:, 2:3])
         # Optimization step
-        loss_value, losses = self.train_step(step, batch,x_batch,y_batch,t_batch, X_bd_vel, Y_bd_vel,
-                                                X_bd_pre, Y_bd_pre,X_data,Y_data)
+        loss_value = self.train_step()
         
-        self.logger.log_train_batch(step, loss_value, losses)
+        self.logger.log_train_batch(step, loss_value, self.losses)
       self.logger.log_train_epoch(epoch, loss_value)
     self.logger.log_train_end(tf_epochs)
   
   # Train in tf graph mode
   @tf.function
-  def train_step(self,step, batch,x_batch,y_batch,t_batch, X_bd_vel, Y_bd_vel,
-                                          X_bd_pre, Y_bd_pre,X_data,Y_data):
+  def train_step(self):
     
-    loss_value, grads, losses = self.f_grad(x_batch,y_batch,t_batch,
-                                            X_bd_vel, Y_bd_vel,
-                                            X_bd_pre, Y_bd_pre,
-                                            X_data,Y_data)
+    loss_value, grads = self.f_grad()
     self.optimizer.apply_gradients(zip(grads, self.model.trainable_variables))
     # check graph mode
     # tf.print("Eager execution: {}".format(tf.executing_eagerly())) 
-    return loss_value, losses
+    return loss_value
     
   
   # @tf.function
@@ -427,12 +445,47 @@ class PINN(object):
   def set_outside_points(self,points):
     self.X_outside =tf.convert_to_tensor(points, dtype=self.dtype)
     return
-  def set_dynamic_weight(self,pinn_w = [1,1,1,1,1,1], dynamic_weight_method = 'NONE', term_weights = [1,1,1],
+  
+  def start_dynamic_weight(self,pinn_w = [1,1,1,1,1,1], dynamic_weight_method = 'NONE', term_weights = [1,1,1],
                          w_decay = 0.1, weight_update_step = 200, start = 1, EMA_decay = 0.04,
                          temperature = 1e-2, alpha_decay = 0.99, rho_std = 0.1,
                          LR_decay = 0.9):
     
+    ## shold be included in init()
     
+
+    self.pinn_w = tf.Variable(pinn_w, trainable = False, dtype=self.dtype)
+    self.term_weights = tf.Variable(term_weights, trainable = False, dtype=self.dtype)
+    self.dynamic_weight_method = tf.Variable(dynamic_weight_method, trainable = False, dtype = tf.string)
+    ##
+    self.w_decay = tf.Variable(w_decay, trainable = False)
+    self.EMA_decay = tf.Variable(EMA_decay, trainable = False)
+    self.weight_update = tf.Variable(weight_update_step, trainable = False,dtype=tf.int16)
+    self.lossmemory_dt = tf.Variable(0,trainable=False, dtype=self.dtype)
+    self.lossmemory_bd= tf.Variable(0,trainable=False, dtype=self.dtype)
+    self.alpha_star  = tf.Variable(0,trainable=False, dtype=self.dtype)
+    self.beta_star  = tf.Variable(0,trainable=False, dtype=self.dtype)
+    self.alpha  = tf.Variable(start,trainable=False, dtype=self.dtype)
+    self.beta  = tf.Variable(start,trainable=False, dtype=self.dtype)
+    self.max_loss_eq  = tf.Variable(0,trainable=False, dtype=self.dtype)
+    self.inter_count = tf.Variable(0, trainable=False, dtype= tf.int16)
+    ##
+    self.T = tf.Variable(temperature, trainable=False, dtype= self.dtype)
+    self.previus_loss = tf.Variable([0,0,0],trainable=False, dtype=self.dtype)
+    self.previus_lamb = tf.Variable([0,0,0],trainable=False, dtype=self.dtype)
+    self.lamb_0 = tf.Variable([0,0,0],trainable=False, dtype=self.dtype)
+    self.alpha_decay = tf.Variable(alpha_decay,trainable=False, dtype=self.dtype)
+    self.rho_std = tf.Variable(rho_std,trainable=False, dtype=self.dtype)
+    ##
+    self.LR_decay = tf.Variable(LR_decay,trainable=False, dtype=self.dtype)
+    self.LR_alpha  = tf.Variable(start,trainable=False, dtype=self.dtype)
+    self.LR_beta  = tf.Variable(start,trainable=False, dtype=self.dtype)
+    return
+  
+  def set_dynamic_weight(self,pinn_w = [1,1,1,1,1,1], dynamic_weight_method = 'NONE', term_weights = [1,1,1],
+                            w_decay = 0.1, weight_update_step = 200, start = 1, EMA_decay = 0.4,
+                            temperature = 1e-2, alpha_decay = 0.99, rho_std = 0.1,
+                            LR_decay = 0.9):
     """  *  pinn_w  =>  weight for each part separately.
     order:[momentum , mass, vel bd,pressure bd, data, out_vel]
     
@@ -463,39 +516,6 @@ class PINN(object):
 
     
     """
-    self.pinn_w = tf.Variable(pinn_w, trainable = False, dtype=self.dtype)
-    self.term_weights = tf.Variable(term_weights, trainable = False, dtype=self.dtype)
-    self.dynamic_weight_method = tf.Variable(dynamic_weight_method, trainable = False, dtype = tf.string)
-    ##
-    self.w_decay = tf.Variable(w_decay, trainable = False)
-    self.EMA_decay = tf.Variable(EMA_decay, trainable = False)
-    self.weight_update = tf.Variable(weight_update_step, trainable = False,dtype=tf.int16)
-    self.lossmemory_dt = tf.Variable(0,trainable=False, dtype=self.dtype)
-    self.lossmemory_bd= tf.Variable(0,trainable=False, dtype=self.dtype)
-    self.alpha_star  = tf.Variable(0,trainable=False, dtype=self.dtype)
-    self.beta_star  = tf.Variable(0,trainable=False, dtype=self.dtype)
-    self.alpha  = tf.Variable(start,trainable=False, dtype=self.dtype)
-    self.beta  = tf.Variable(start,trainable=False, dtype=self.dtype)
-    self.max_loss_eq  = tf.Variable(0,trainable=False, dtype=self.dtype)
-    self.inter_count = tf.Variable(0, trainable=False, dtype= tf.int16)
-    ##
-    self.T = tf.Variable(temperature, trainable=False, dtype= self.dtype)
-    self.previus_loss = tf.Variable([0,0,0],trainable=False, dtype=self.dtype)
-    self.previus_lamb = tf.Variable([0,0,0],trainable=False, dtype=self.dtype)
-    self.lamb_0 = tf.Variable([0,0,0],trainable=False, dtype=self.dtype)
-    self.alpha_decay = tf.Variable(alpha_decay,trainable=False, dtype=self.dtype)
-    self.rho_std = tf.Variable(rho_std,trainable=False, dtype=self.dtype)
-    ##
-    self.LR_decay = tf.Variable(LR_decay,trainable=False, dtype=self.dtype)
-    self.LR_alpha  = tf.Variable(start,trainable=False, dtype=self.dtype)
-    self.LR_beta  = tf.Variable(start,trainable=False, dtype=self.dtype)
-    return
-  
-  def update_dynamic_weight(self,pinn_w = [1,1,1,1,1,1], dynamic_weight_method = 'NONE', term_weights = [1,1,1],
-                            w_decay = 0.1, weight_update_step = 200, start = 1, EMA_decay = 0.4,
-                            temperature = 1e-2, alpha_decay = 0.99, rho_std = 0.1,
-                            LR_decay = 0.9):
-    
     self.pinn_w.assign(pinn_w)
     self.term_weights.assign(term_weights)
     self.dynamic_weight_method.assign(dynamic_weight_method)
