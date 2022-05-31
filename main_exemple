@@ -8,9 +8,6 @@ main code and parameter to calculate flow by PINN
 using tensorflow 2.5.0
 visco cine	densi	visco dina		
 0.00005		  0.8	     0.00004	
-
-foward chega 7.8e-2 na sorte nos primeros 10 epochs
-       2.3e-2 controlando o pinn_w com 1000+ epochs
 """ 
 
 import os
@@ -19,7 +16,7 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '1'  # or any {'0', '1', '2'}
 import tensorflow as tf
 import tensorflow.keras
 import numpy as np
-import PINN_Dynamicweight as bib
+import CAN_PINN as bib
 import My_data
 
 
@@ -65,9 +62,9 @@ N_lhc = 10000
     lb - lower boundary
 """
 def normaliz(matr, l, u):
-  return 2.0*((matr - l)/(u - l + 0.0001)) - 1.0
+  return 2.0*((matr - l)/(u - l + 0.00000001)) - 1.0
 def denormaliz(matr, l, u):
-  return ((matr+1)*(u - l + 0.0001))/2 +l
+  return ((matr+1)*(u - l + 0.00000001))/2 +l
 
 
 x,y,t,X,Y,Ti,Input_data_train,Output_data_train,Input_star,Output_star, \
@@ -90,8 +87,6 @@ BD_Xpre_train = normaliz(BD_Xpre_train,lb,ub)[:,0:2]
 Input_data_train = normaliz(Input_data_train,lb,ub)[:,0:2]
 Input_star = normaliz(Input_star,lb,ub)[:,0:2]
 X_train = np.vstack([BD_Xvel_train,BD_Xpre_train,Input_data_train])
-
-
 #------------ MAIN
 def error():
   u_pred= pinn.predict(Input_star)
@@ -111,9 +106,9 @@ log_frequency_batch = 5
 # PIdeepNN topology (3-sized input [x y t], 9 hidden layer of 128-width, 3-sized output [u,v,p]
 nodes = 16
 layers = [2, nodes,nodes,nodes,nodes,nodes,nodes, 3]
-# layers = [[2, nodes,nodes,nodes, 1],
-#           [2, nodes,nodes,nodes, 1],
-#           [2, nodes, 1]]
+# layers = [[2, nodes,nodes,nodes,nodes,nodes, 1],
+#           [2, nodes,nodes,nodes,nodes,nodes, 1],
+#           [2, nodes,nodes,nodes,nodes,nodes, 1]]
 # layers = [2, nodes,nodes, 3]
 #layers = [[2, nodes,nodes, 1],
 #          [2, nodes,nodes, 1],
@@ -141,20 +136,19 @@ terms are created by combining the parts:
 """
 
 # Setting up the TF Adam optimizer (it can be canceled set Adam_epochs=0) RMSprop ,
-Adam_epochs = 1000
+Adam_epochs = 1500
 batch_size = N_lhc #64
 activation=tf.nn.silu
+
 # momentum , mass, vel bd,pressure bd, data, out_vel
-# pinn_w =[1,.2,20,1,20,0]
-pinn_w =[1,.5,2,1,2,0]
+pinn_w =[1,.65,1,1,1,0]
 
 # equations, boundary conditions, data
-term_weights = [.01,.1,1]
-
+term_weights =  [1,1.05,1.1]
 # lr_boundaries =[N_lhc/batch_size * 10, N_lhc/batch_size *20, N_lhc/batch_size *30,N_lhc/batch_size *50,N_lhc/batch_size *300]
-lr_boundaries =[N_lhc/batch_size * 1250, N_lhc/batch_size * (2500+1250)]
+lr_boundaries =[400, (1100),(2000), (5000)]
 
-values = [1e-2, 3e-3, 1.1e-3]
+values = [1e-2, 1e-3, 0.5e-3, 1e-4, 1e-5]
 
 learning_rate_fn = tf.keras.optimizers.schedules.PiecewiseConstantDecay(lr_boundaries, values)
 # learning_rate_fn = 1e-3
@@ -169,22 +163,14 @@ logs.set_error_fn(error)
 logs.set_error_fn2(error2,'PINN_error')
 
 
-pinn = bib.PINN(Adam_optimizer, logs, Colocations_points, rho = 0.8, mu = 0.00004, Steady = True)
-# activation=pinn.Dynamic_activation
+pinn = bib.PINN(Adam_optimizer, Colocations_points, logs, diff ='ND1', rho = 0.8, mu = 0.00004, Steady = True)
 pinn.Foward(layers, activation) # Create pinn.model
 
 if use_trained_model_flag:
   pinn.model.load_weights(WEIGHTS_PATH)
 
-## INITIALIZATION:   on data points and BD only **better with DW_balance, ReLoBRalo 
-                     ##     -> dont need to use with LR_Annealing(term_weight=[1,1,1] is  better)
-pinn.update_dynamic_weight([0,0,1,1,10,0], 'NO')
-with tf.device('/GPU:4'):
-  pinn.fit(BD_Xvel_train, BD_Yvel_train, BD_Xpre_train,BD_Ypre_train,
-            Input_data_train,Output_data_train, 8 , 64)
-  
 ##  ADAM TRAINING
-pinn.update_dynamic_weight(pinn_w, 'relobralo', term_weights, temperature = 1e-6, alpha_decay = 0.9, rho_std = 0.1)
+pinn.set_dynamic_weight(pinn_w,'b',term_weights)
 with tf.device('/GPU:4'):
   pinn.fit(BD_Xvel_train, BD_Yvel_train, BD_Xpre_train,BD_Ypre_train,
             Input_data_train,Output_data_train,Adam_epochs, batch_size)
@@ -195,15 +181,12 @@ with tf.device('/GPU:4'):
 # def build_loss(log_frequency_LBFGS = 50):
 
 #   # loss Function from PINN
-#   loss , _ = pinn.f_loss(pinn.X_pinn_train_x, pinn.X_pinn_train_y, pinn.X_pinn_train_t, 
-#               pinn.X_bd_vel, pinn.Y_bd_vel,
-#               pinn.X_bd_pre, pinn.Y_bd_pre,
-#               pinn.X_data,pinn.Y_data)
+#   loss = pinn.f_loss()
 #   iteration.assign_add(1)
 #   if tf.math.floormod(iteration, log_frequency_LBFGS) == 0:
 #     tf.print('LBFGS Interation = ', iteration ,'  loss = ', loss)
 #   return loss
-# pinn.update_dynamic_weight([.01,.008,2,1,2,0], '', term_weights)
+# # pinn.set_dynamic_weight(pinn_w, 'No', term_weights)
 # ## set pinn_w = [1,1,1,1,1,1]
 # trainable_variables =  pinn.model.trainable_variables  # the network weights and biases
 
@@ -227,26 +210,3 @@ u_pred = pinn.predict(Input_star)
 My_data.plot1(Input_star, u_pred.numpy(), X_train,Input_data_train,
              Real_output, X[:,:,0], Y[:,:,0],  x, y)
 
-
-#----------------WSS
-# import Shear_rate_calculation as SR
-# import matplotlib.pyplot as plt
-# import pickle
-
-# with open('wall_estenose', 'rb') as f:
-#   line,fit_upperbd,fit_lowerbd= pickle.load(f)
-
-# U_pred,V_pred,P_pred = My_data.GridData(Input_star, u_pred.numpy(), X, Y)
-# wall = fit_upperbd
-# deltas = [2,3,4,5,6]
-# resolution  = 0.0001 #m/pixel
-
-# Shear_rate = SR.Shear_rate(U_pred,V_pred,wall,line,deltas)
-
-# Shear_rate_avg = Shear_rate.mean(0)
-# Shear_rate_max = Shear_rate.max(0)
-# plt.figure()
-# plt.plot(line[:,0],Shear_rate_avg,line[:,0],Shear_rate_max)
-# plt.legend(['Shear_rate_avg','Shear_rate_max'])
-# with open('WSS_ultimo_estenose', 'wb') as f:
-#         pickle.dump([Shear_rate], f)
