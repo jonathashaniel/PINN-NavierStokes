@@ -5,114 +5,142 @@ Created on Tue May 18 16:24:58 2021
 @author: Jonathas Haniel
 
 main code and parameter to calculate flow by PINN
-using tensorflow 2.5.0
+using tensorflow 2.8.0
 visco cine	densi	visco dina		
 0.00005		  0.8	     0.00004	
-""" 
+
+foward chega 7.8e-2 na sorte nos primeros 10 epochs
+        7e-2 controlando o pinn_w com 1000+ epochs
+
+"""
 
 import os
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '1'  # or any {'0', '1', '2'}
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '10'  # or any {'0', '1', '2'}
+os.environ['AUTOGRAPH_VERBOSITY'] = '0'
 # import sys
 import tensorflow as tf
 import tensorflow.keras
+import pickle
 import numpy as np
-import CAN_PINN as bib
+import CAN_PINN_newtransient as bib
 import My_data
+import read_matlab_data as US
+import Shear_rate_calculation as SR
+import matplotlib.pyplot as plt
 
-
-gpus = tf.config.experimental.list_physical_devices('GPU')
-if gpus:
-    try:
-        # Currently, memory growth needs to be the same across GPUs
-        for gpu in gpus:
-            tf.config.experimental.set_memory_growth(gpu, True)
-        logical_gpus = tf.config.experimental.list_logical_devices('GPU')
-        print(len(gpus), "Physical GPUs,", len(logical_gpus), "Logical GPUs")
-    except RuntimeError as e:
-        # Memory growth must be set before GPUs have been initialized
-        print(e)
+import pickle
+save_path_pred = 'T:\\Jonathas\\WSR_bifurcation\\0p\\PINN_pred_smooth\\'
+save_path_WSS =  "T:\\Jonathas\\WSR_bifurcation\\0p\\PINN_WSS_smooth\\"
 
 # Setting random seed
-np.random.seed(1200)
-tf.random.set_seed(1200)
+# np.random.seed(1200)
+# tf.random.set_seed(1200)
 
 # Size of Data with solution on boundary condition
-N_bd_vel = 800
-N_bd_out = 100
+# N_bd_vel = 500
+# N_bd_out = 100
 # Size of Data with solution on fluid domain
-N_data_train = 100
-# Number of points where we’ll check physic-s informed loss, selected by Latin Hypercube (lhc)
+N_data_train = 900
+# Number of points where we’ll check physics informed loss, selected by Latin Hypercube (lhc)
 N_lhc = 10000
 
 # Getting the data
-""" Necessary data for the mesh:
-    x - x-position of each mesh elements (,1)   
-    y - y-position of each mesh elements (,1)    
-    t - time  of each time-step (,1)    
-    X,Y,T = meshgrid(x,y,t)
-    Exact u,v - Exact velocity to calcule error
-    Input_star - all combination of inputs (,3)
-    Output_star - all combination of outputs (,3)
-    Input_train_bd - all combination of inputs used for training in boundary condition(,3)
-    Output_train_bd -  all combination of outputs used for training in boundary condition(,3)
-    Input_train_D - all combination of inputs used for training in fluid domain(,3)
-    Output_train _D-  all combination of outputs used for training in fluid domain(,3)
-  
-    ub - upper boundary
-    lb - lower boundary
+""" 
+Necessary data for the mesh:
+x - x-position of each mesh elements (,1)   
+y - y-position of each mesh elements (,1)    
+t - time  of each time-step (,1)    
+X,Y,T = meshgrid(x,y,t)
+Exact u,v - Exact velocity to calcule error
+Input_star - all combination of inputs (,3)
+Output_star - all combination of outputs (,3)
+Input_train_bd - all combination of inputs used for training in boundary condition(,3)
+Output_train_bd -  all combination of outputs used for training in boundary condition(,3)
+Input_train_D - all combination of inputs used for training in fluid domain(,3)
+Output_train _D-  all combination of outputs used for training in fluid domain(,3)
+
+ub - upper boundary
+lb - lower boundary
 """
+
 def normaliz(matr, l, u):
-  return 2.0*((matr - l)/(u - l + 0.00000001)) - 1.0
+  return 2.0*((matr - l)/(u - l + 0.0001)) - 1.0
 def denormaliz(matr, l, u):
-  return ((matr+1)*(u - l + 0.00000001))/2 +l
+  return ((matr+1)*(u - l + 0.0001))/2 +l
 
 
-x,y,t,X,Y,Ti,Input_data_train,Output_data_train,Input_star,Output_star, \
-  BD_Xvel_train,BD_Yvel_train,BD_Xpre_train,BD_Ypre_train, \
-  Colocations_points,X_star,Real_output = My_data.get_data_for_test(
-    N_bd_vel, N_bd_out, N_lhc,N_data_train,x_size = 260,y_size = 100, t_size = 1)
+# save_path = 'T:\Jonathas\HeleShawWSR\PINN\HeleShaw.pkl'
+save_path = 'T:\\Jonathas\\WSR_bifurcation\\0p\\bifurca_faketransient_vel_ref.pkl'
 
+with open(save_path, 'rb') as f:
+  wall_bd, velocity_wall,X_star, Y_star, \
+  input_train_data,output_train_data, \
+  colocation_points, colocation_points_output, \
+  outlet_bd, outlet_bd_pressure,vel_img,outside_points,\
+    line,fit_upperbd,fit_lowerbd= pickle.load(f)
+    
+x_size = 381
+y_size = 251
+
+x = np.arange(0,x_size,1)[:,None]
+y = np.arange(0,y_size,1)[:,None]
+X, Y = np.meshgrid(x,y)
+X_star1 = np.hstack((X.flatten()[:,None],Y.flatten()[:,None]))
 #nomalize every input data
-lb = X_star.min(axis=0)
-ub = X_star.max(axis=0)
+lb = np.array([0, 0])
+ub = np.array([380, 380])
 x = normaliz(x,lb[0],ub[0])
 X = normaliz(X,lb[0],ub[0])
 y = normaliz(y,lb[1],ub[1])
 Y = normaliz(Y,lb[1],ub[1])
-t = normaliz(t,lb[2],ub[2])
-Ti = normaliz(Ti,lb[2],ub[2])
-Colocations_points = normaliz(Colocations_points,lb,ub)
-BD_Xvel_train = normaliz(BD_Xvel_train,lb,ub)[:,0:2]
-BD_Xpre_train = normaliz(BD_Xpre_train,lb,ub)[:,0:2]
-Input_data_train = normaliz(Input_data_train,lb,ub)[:,0:2]
-Input_star = normaliz(Input_star,lb,ub)[:,0:2]
-X_train = np.vstack([BD_Xvel_train,BD_Xpre_train,Input_data_train])
+
+Colocations_points = normaliz(colocation_points,lb,ub)
+BD_Xpre_train = normaliz(outlet_bd,lb,ub)
+Input_data_train = normaliz(input_train_data,lb,ub)
+Input_star = normaliz(X_star,lb,ub)
+outside_points = normaliz(outside_points,lb,ub)
+BD_Yvel_train = velocity_wall
+BD_Ypre_train = outlet_bd_pressure
+
+# Output_data_train = output_train_data
+# Real_output = vel_img
+# vel_img = np.nan_to_num(vel_img)
+# Y_star = np.hstack([Y_star,np.zeros((len(Y_star),1))])
+# Output_star = Y_star
+
+Output_data_train = tf.Variable(output_train_data[:,:,0],trainable=False, dtype=tf.float32)
+Output_star = tf.Variable(np.hstack([Y_star[:,:,0],np.zeros((len(Y_star),1))]) , trainable=False, dtype=tf.float32)
+
+
+# X_train = np.vstack([BD_Xvel_train,BD_Xpre_train,Input_data_train])
+
 #------------ MAIN
 def error():
-  u_pred= pinn.predict(Input_star)
-  return np.linalg.norm(Output_star - u_pred, 2) / np.linalg.norm(Output_star, 2)
+  u_pred = pinn.predict(Input_star)
+  return np.linalg.norm(Output_star[:,0:2]  - u_pred[:,0:2] , 2) / np.linalg.norm(Output_star[:,0:2] , 2)
 def error2():
-  u_pred= pinn.predict(Input_data_train)
-  return np.linalg.norm(Output_data_train - u_pred, 2) / np.linalg.norm(Output_data_train, 2)
-
-LOGS_FILE = "test_est.csv"
-WEIGHTS_PATH ='.\save\last_weights'
-
+   u_pred= pinn.predict(Input_data_train)
+   return np.linalg.norm(Output_data_train[:,0:2] - u_pred[:,0:2] , 2) / np.linalg.norm(Output_data_train[:,0:2], 2)
+ 
+  
+LOGS_FILE = "test.csv"
+WEIGHTS_PATH ='save\last_weights'
+# WEIGHTS_PATH ='.\save\last_weights'
 save_weights_flag = True
-use_trained_model_flag = False
-log_frequency_epoch = 10
-log_frequency_batch = 5
+use_trained_model_flag = True
+log_frequency_epoch = 5
+log_frequency_batch = 0
 
 # PIdeepNN topology (3-sized input [x y t], 9 hidden layer of 128-width, 3-sized output [u,v,p]
-nodes = 16
-layers = [2, nodes,nodes,nodes,nodes,nodes,nodes, 3]
-# layers = [[2, nodes,nodes,nodes,nodes,nodes, 1],
-#           [2, nodes,nodes,nodes,nodes,nodes, 1],
-#           [2, nodes,nodes,nodes,nodes,nodes, 1]]
-# layers = [2, nodes,nodes, 3]
-#layers = [[2, nodes,nodes, 1],
-#          [2, nodes,nodes, 1],
-#          [2, nodes, 1]]
+nodes = 48
+layers = [2, nodes,nodes,nodes,nodes,nodes,nodes,nodes,nodes, 3]
+# layers = [[2, nodes,nodes,nodes,nodes,nodes,nodes,nodes,nodes, 1],
+#           [2, nodes,nodes,nodes,nodes,nodes,nodes,nodes,nodes, 1],
+#           [2, nodes,nodes,nodes,nodes,nodes,nodes,nodes, 1]]
+# layers = [2, nodes,nodes,nodes,3]
+# layers = [[2, nodes,nodes,nodes,1],
+#           [2, nodes,nodes,nodes,1],
+#           [2, nodes,nodes,1]]
 
 """  *  pinn_w  =>  weight for each part separately.
 order:
@@ -134,24 +162,26 @@ terms are created by combining the parts:
 - influences only if dynamic weight is on (is_dynamic_weight = True)
 - 'can increase the relevance of one term o opmization search'  
 """
-
 # Setting up the TF Adam optimizer (it can be canceled set Adam_epochs=0) RMSprop ,
-Adam_epochs = 1500
+Adam_epochs = 250
 batch_size = N_lhc #64
 activation=tf.nn.silu
 
+
 # momentum , mass, vel bd,pressure bd, data, out_vel
-pinn_w =[1,.65,1,1,1,0]
+pinn_w =[1,1,1,1,1,1]
 
 # equations, boundary conditions, data
-term_weights =  [1,1.05,1.1]
+term_weights =  [1.0,1.1,1.0] #[1,1.05,1.1]
+# term_weights =  [.01,.1,1] 
+
 # lr_boundaries =[N_lhc/batch_size * 10, N_lhc/batch_size *20, N_lhc/batch_size *30,N_lhc/batch_size *50,N_lhc/batch_size *300]
-lr_boundaries =[400, (1100),(2000), (5000)]
+lr_boundaries =[N_lhc/batch_size *100, N_lhc/batch_size *300, N_lhc/batch_size *(600),N_lhc/batch_size *(800)]
 
-values = [1e-2, 1e-3, 0.5e-3, 1e-4, 1e-5]
+values = [5e-2, 1e-2, 5e-3, 1.5e-3, 8e-4]
 
-learning_rate_fn = tf.keras.optimizers.schedules.PiecewiseConstantDecay(lr_boundaries, values)
-# learning_rate_fn = 1e-3
+# learning_rate_fn = tf.keras.optimizers.schedules.PiecewiseConstantDecay(lr_boundaries, values)
+learning_rate_fn = 0.8e-4
 Adam_optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate_fn)
 
 
@@ -162,51 +192,85 @@ logs = bib.Logs(log_frequency_epoch,log_frequency_batch)
 logs.set_error_fn(error)
 logs.set_error_fn2(error2,'PINN_error')
 
+rho = 0.997; mu = 1e-3 ; U=1; L = (380*0.0001)/2
 
-pinn = bib.PINN(Adam_optimizer, Colocations_points, logs, diff ='ND1', rho = 0.8, mu = 0.00004, Steady = True)
+pinn = bib.PINN(Adam_optimizer, Colocations_points, logs, diff ='ND2', rho = 0.997 , mu = 1e-3 , Re = (rho*U*L)/mu , diff_delta = 5e-5,
+                diff_delta_t = (1/400)/(L/U), Steady = False)
 pinn.Foward(layers, activation) # Create pinn.model
 
+#time reference point
 if use_trained_model_flag:
   pinn.model.load_weights(WEIGHTS_PATH)
-
-##  ADAM TRAINING
-pinn.set_dynamic_weight(pinn_w,'b',term_weights)
-with tf.device('/GPU:4'):
-  pinn.fit(BD_Xvel_train, BD_Yvel_train, BD_Xpre_train,BD_Ypre_train,
-            Input_data_train,Output_data_train,Adam_epochs, batch_size)
+previus_pred = pinn.predict(Colocations_points)[:,0:2]
   
-# ##  L-BFGS traning
+for ttt in range(404):
+# ## Transient data to run on steady-state
+# ttt = 51
+  print('time = ',ttt)
+  Output_data_train.assign(output_train_data[:,:,ttt]) ##time
+  Real_output = np.nan_to_num(vel_img[:,:,ttt]) ##time
+  Output_star.assign(np.hstack([Y_star[:,:,ttt],np.zeros((len(Y_star),1))]) ) ##time
+  BD_Xvel_train = normaliz(wall_bd[:,:,ttt],lb,ub)##time
 
-# iteration = tf.Variable(0)
-# def build_loss(log_frequency_LBFGS = 50):
+  if use_trained_model_flag:
+    pinn.model.load_weights(WEIGHTS_PATH)
+  
+  ##  ADAM TRAINING
+  pinn.set_dynamic_weight(pinn_w,'LR_annealing',term_weights)
+  pinn.Compile(BD_Xvel_train, BD_Yvel_train, BD_Xpre_train,BD_Ypre_train,
+            Input_data_train,Output_data_train,[],previus_pred)
+  
+  with tf.device('/GPU:4'):
+    pinn.fit(Adam_epochs, batch_size) 
+  
+  # pinn.set_dynamic_weight(pinn_w,'LR_annealing',[1.05,15.0,1.0])
+  # with tf.device('/GPU:4'):
+  #   pinn.fit(200, batch_size) 
+  
+  # Getting the model predictions, from the same (x,y,t) that the predictions were previously gotten from
+  u_pred = pinn.predict(Input_star)
+  previus_pred = pinn.predict(Colocations_points)[:,0:2]
+  
+  if save_weights_flag:
+    pinn.model.save_weights(WEIGHTS_PATH, overwrite=True)
+    # pinn.model.save('D:\Python codes\CNNfCFD\Jonathas_PINN\save\lastmodel', overwrite=True)
+  
+  # X_train = np.vstack([BD_Xvel_train,BD_Xpre_train,Input_data_train])
+  # My_data.plot_steady(Input_star, u_pred.numpy(), X_train,Input_data_train,
+  #               Real_output, X, Y, x, y,[130,230,300])
+    
+  if False:
+    logs.save(LOGS_FILE) #save csv file of loss and error
+  
+  # # WSS
+  U_pred,V_pred,P_pred = My_data.GridData(Input_star, u_pred.numpy(), X, Y)
+  wall = fit_upperbd[:,1]
+  deltas = [10,15,20,25,30]
+  resolution  = 0.0001 #m/pixel
+  line1 = line
+  
+  Shear_rate = SR.Shear_rate(U_pred,V_pred,wall,line1,deltas)
+  
+  Shear_rate_avg = Shear_rate.mean(0)
+  Shear_rate_max = Shear_rate.max(0)
+  
+  from scipy.interpolate import griddata
 
-#   # loss Function from PINN
-#   loss = pinn.f_loss()
-#   iteration.assign_add(1)
-#   if tf.math.floormod(iteration, log_frequency_LBFGS) == 0:
-#     tf.print('LBFGS Interation = ', iteration ,'  loss = ', loss)
-#   return loss
-# # pinn.set_dynamic_weight(pinn_w, 'No', term_weights)
-# ## set pinn_w = [1,1,1,1,1,1]
-# trainable_variables =  pinn.model.trainable_variables  # the network weights and biases
-
-# with tf.device('/GPU:4'):
-#   bib.lbfgs_minimize(trainable_variables, build_loss,
-#                       LBFGS_options = bib.set_LBFGS_options(
-#                         num_correction_pairs=100, f_relative_tolerance=0, parallel_iterations = 1,
-#                         tolerance=1e-5, max_iterations=1500, max_line_search_iterations=50 ))
-
-
-# Getting the model predictions, from the same (x,y,t) that the predictions were previously gotten from
-u_pred = pinn.predict(Input_star)
-print('Final error = ', error(),'**', np.sqrt(np.square(np.mean(Output_star - u_pred)/np.mean(Output_star))))
-logs.save(LOGS_FILE) #save csv file of loss and error
-
-if save_weights_flag:
-  pinn.model.save_weights(WEIGHTS_PATH, overwrite=True)
-
-#--------end ** plot results
-u_pred = pinn.predict(Input_star)
-My_data.plot1(Input_star, u_pred.numpy(), X_train,Input_data_train,
-             Real_output, X[:,:,0], Y[:,:,0],  x, y)
+  U_pred1 = griddata(Input_star, Output_star[:,0:1], (X[:,:], Y[:,:]), method='nearest')
+  V_pred1 = griddata(Input_star, Output_star[:,1:2], (X[:,:], Y[:,:]), method='nearest')
+  P_pred1 = griddata(Input_star, Output_star[:,2:3], (X[:,:], Y[:,:]), method='nearest')
+  Shear_rate_US = SR.Shear_rate(U_pred1,V_pred1,wall,line1,deltas)
+  Shear_rate_US_avg = Shear_rate_US.mean(0)
+  Shear_rate_US_max = Shear_rate_US.max(0)
+  
+  with open(save_path_pred+str(ttt)+'.pkl', 'wb') as f:
+    pickle.dump([u_pred.numpy()], f)
+  
+  with open(save_path_WSS+str(ttt)+'.pkl', 'wb') as f:
+    pickle.dump([Shear_rate,Shear_rate_US], f)
+    
+  # plt.figure()
+  # plt.plot(line1[:,0],Shear_rate_avg,'--k',line1[:,0],Shear_rate_max,'--r')
+  # plt.plot(line1[:,0],Shear_rate_US_avg,'k',line1[:,0],Shear_rate_US_max,'r')
+  # plt.legend(['PINN Shear_rate_avg','PINN Shear_rate_max','US Shear_rate_avg','US Shear_rate_max'])
 
