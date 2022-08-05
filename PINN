@@ -17,23 +17,24 @@ from datetime import datetime
 
 
 class PINN(object):
-  def __init__(self, optimizer, X_f, logger, rho = 1, mu = 0.0001, diff ='AD', diff_delta = 0.125, Steady = False):
-    self.mu = mu
-    self.rho = rho
+  def __init__(self, optimizer, X_f, logger, rho = 1, mu = 0.0001,Re = 0.001, diff ='AD', diff_delta = 0.0125, diff_delta_t = 1, Steady = False):
+    self.dtype = tf.float32
+    self.mu = tf.constant(mu, self.dtype)
+    self.rho = tf.constant(rho,  self.dtype)
+    self.Re = tf.constant(Re,  self.dtype)
     self.optimizer = optimizer
     self.logger = logger
-    self.dtype = tf.float32
     self.steady  = Steady
     self.diff_method = diff
     self.X_pinn_train = tf.convert_to_tensor(X_f, dtype=self.dtype)
-    self.X_pinn_train_x = self.X_pinn_train[:, 0:1]
-    self.X_pinn_train_y = self.X_pinn_train[:, 1:2]
-    self.X_pinn_train_t = tf.convert_to_tensor([], dtype=self.dtype)
-    if not self.steady:
-      self.X_pinn_train_t = self.X_pinn_train[:, 2:3]
-    self.X_outside = tf.convert_to_tensor([], dtype=self.dtype)
     self.losses = tf.Variable([0,0,0,0,0,0], trainable=False, dtype=self.dtype)
-    self.DELTA = tf.constant([diff_delta],dtype=self.dtype)  #delta for numeric differentiation (remember x,y,and t are normalized [-1,+1])
+    self.DELTA = tf.Variable(diff_delta, trainable=False, dtype=self.dtype)  #delta for numeric differentiation (remember x,y,and t are normalized [-1,+1])
+    self.DELTA_t = tf.Variable(diff_delta_t, trainable=False, dtype=self.dtype)  #delta for numeric differentiation over time (check if  t are normalized)
+    self.x_batch = tf.Variable(tf.zeros(shape = [self.X_pinn_train.shape[0],1]), trainable=False, dtype=self.dtype)
+    self.y_batch = tf.Variable(tf.zeros(shape = [self.X_pinn_train.shape[0],1]), trainable=False, dtype=self.dtype)
+    self.t_batch = tf.Variable(tf.zeros(shape = [self.X_pinn_train.shape[0],1]), trainable=False, dtype=self.dtype)
+    self.batch_size = tf.Variable(0, trainable=False, dtype=tf.int32)
+    self.Set_Data_flag = tf.Variable(0, trainable=False, dtype=tf.int32)
     
     self.start_dynamic_weight()
     
@@ -165,7 +166,7 @@ class PINN(object):
     
     
   # calculate loss gradients to update weights and bias
-  @tf.function
+  # @tf.function
   def f_grad(self):
     
     ##this double gradient tape make everything slow to compile 
@@ -174,7 +175,7 @@ class PINN(object):
     return loss_value, tape.gradient(loss_value, self.model.trainable_variables)
 
   # Defining custom loss
-  @tf.function
+  # @tf.function
   def f_loss(self):
     
     #dynamic weights
@@ -188,7 +189,7 @@ class PINN(object):
       loss = tf.reduce_sum(self.Calculate_separate_losses())  
     return loss
   
-  @tf.function
+  # @tf.function
   def Calculate_separate_losses(self):
     # verify and calculate loss data and/or boundary
     if self.Y_bd_vel.shape[0]>0:
@@ -236,7 +237,7 @@ class PINN(object):
     
     return [l1, l2, l3, l4 ,l5, l6]
   
-  @tf.function
+  # @tf.function
   def Navier_Stokes_Residuals(self):
     #chose differentiation method
     if self.diff_method == 'ND1':
@@ -252,38 +253,30 @@ class PINN(object):
       
     u,v,p,u_x,u_y,u_t,v_x,v_y,v_t,p_x,p_y,u_xx,u_yy,v_xx,v_yy = Diff_scheme() 
     # NAVIER-STOKES residuals
-    loss_x = self.rho * (u_t + u*u_x + v*u_y) + p_x - self.mu*(u_xx + u_yy )
-    loss_y = self.rho * (v_t + u*v_x + v*v_y) + p_y - self.mu*(v_xx + v_yy )
-    # loss_x = (u_t + u*u_x + v*u_y) + p_x - (1/RE)*(u_xx + u_yy )
-    # loss_y = (v_t + u*v_x + v*v_y) + p_y - (1/RE)*(v_xx + v_yy )
+    # loss_x = self.rho * (u_t + u*u_x + v*u_y) + p_x - self.mu*(u_xx + u_yy )
+    # loss_y = self.rho * (v_t + u*v_x + v*v_y) + p_y - self.mu*(v_xx + v_yy )
+    loss_x = (u_t + u*u_x + v*u_y) + p_x - (1/self.Re)*(u_xx + u_yy )
+    loss_y = (v_t + u*v_x + v*v_y) + p_y - (1/self.Re)*(v_xx + v_yy )
     loss_mass = u_x + v_y
     #loss_momentum = (loss_x + loss_y)   'can be weighted to balance components residual'
     return (loss_x + loss_y), loss_mass
     
   
   # Models of PINN loss N-pinn
-  @tf.function
+  # @tf.function
   def ND_Second_Upwind(self):
     # Using numerical diferentiation 2 order upwind for velocity and pressure, and 1 order upwind for time
-    
     # Packing the inputs together 
-    if not self.steady:
-      X_f = tf.stack([self.x_batch[:,0], self.y_batch[:,0], self.t_batch[:,0]], axis=1)
-      X_f_minusDELTAx = tf.stack([self.x_batch[:,0]-self.DELTA, self.y_batch[:,0], self.t_batch[:,0]], axis=1)
-      X_f_minusDELTAy = tf.stack([self.x_batch[:,0], self.y_batch[:,0]-self.DELTA, self.t_batch[:,0]], axis=1)
-      X_f_minus2DELTAx = tf.stack([self.x_batch[:,0]-(2.*self.DELTA), self.y_batch[:,0], self.t_batch[:,0]], axis=1)
-      X_f_minus2DELTAy = tf.stack([self.x_batch[:,0], self.y_batch[:,0]-(2.*self.DELTA), self.t_batch[:,0]], axis=1)
-      X_f_minus3DELTAx = tf.stack([self.x_batch[:,0]-(3.*self.DELTA), self.y_batch[:,0], self.t_batch[:,0]], axis=1)
-      X_f_minus3DELTAy = tf.stack([self.x_batch[:,0], self.y_batch[:,0]-(3.*self.DELTA), self.t_batch[:,0]], axis=1)
-      X_f_minusDELTAt = tf.stack([self.x_batch[:,0], self.y_batch[:,0], self.t_batch[:,0]-self.DELTA], axis=1)
-    else:
-      X_f = tf.stack([self.x_batch[:,0], self.y_batch[:,0]], axis=1)
-      X_f_minusDELTAx = tf.stack([self.x_batch[:,0]-self.DELTA, self.y_batch[:,0]], axis=1)
-      X_f_minusDELTAy = tf.stack([self.x_batch[:,0], self.y_batch[:,0]-self.DELTA], axis=1)
-      X_f_minus2DELTAx = tf.stack([self.x_batch[:,0]-(2.*self.DELTA), self.y_batch[:,0]], axis=1)
-      X_f_minus2DELTAy = tf.stack([self.x_batch[:,0], self.y_batch[:,0]-(2.*self.DELTA)], axis=1)
-      X_f_minus3DELTAx = tf.stack([self.x_batch[:,0]-(3.*self.DELTA), self.y_batch[:,0]], axis=1)
-      X_f_minus3DELTAy = tf.stack([self.x_batch[:,0], self.y_batch[:,0]-(3.*self.DELTA)], axis=1)
+    x_batch = self.x_batch[:self.batch_size,]
+    y_batch = self.y_batch[:self.batch_size,]
+        
+    X_f = tf.stack([x_batch[:,0], y_batch[:,0]], axis=1)
+    X_f_minusDELTAx = tf.stack([x_batch[:,0]-self.DELTA, y_batch[:,0]], axis=1)
+    X_f_minusDELTAy = tf.stack([x_batch[:,0], y_batch[:,0]-self.DELTA], axis=1)
+    X_f_minus2DELTAx = tf.stack([x_batch[:,0]-(2.*self.DELTA), y_batch[:,0]], axis=1)
+    X_f_minus2DELTAy = tf.stack([x_batch[:,0], y_batch[:,0]-(2.*self.DELTA)], axis=1)
+    X_f_minus3DELTAx = tf.stack([x_batch[:,0]-(3.*self.DELTA), y_batch[:,0]], axis=1)
+    X_f_minus3DELTAy = tf.stack([x_batch[:,0], y_batch[:,0]-(3.*self.DELTA)], axis=1)
       
     # Getting deslocaded prediction
     u,v,p = self.Sliced_Predict(X_f)
@@ -309,9 +302,11 @@ class PINN(object):
 
     if not self.steady:
       #first-order upwind (backward difference)  O(\Deltax^1)
-      u_deltat, v_deltat, _ = self.Sliced_Predict(X_f_minusDELTAt)
-      u_t = (u-u_deltat)/self.DELTA 
-      v_t = (v-v_deltat)/self.DELTA 
+      Previus = self.Previus_Pred_batch[:self.batch_size,]
+      u_deltat = tf.slice(Previus,[0,0],[-1,1])
+      v_deltat = tf.slice(Previus,[0,1],[-1,1])
+      u_t = (u-u_deltat)/self.DELTA_t
+      v_t = (v-v_deltat)/self.DELTA_t
     else:
       u_t = 0.
       v_t = 0.
@@ -319,26 +314,19 @@ class PINN(object):
     return u,v,p,u_x,u_y,u_t,v_x,v_y,v_t,p_x,p_y,u_xx,u_yy,v_xx,v_yy
   
   # Models of PINN loss N-pinn
-  @tf.function
+  # @tf.function
   def ND_First_Upwind(self):
     # Using numerical diferentiation 1 order upwind for velocity and pressure, and 1 order upwind for time
-    
     # Packing the inputs together 
-    if not self.steady:
-      X_f = tf.stack([self.x_batch[:,0], self.y_batch[:,0], self.t_batch[:,0]], axis=1)
-      X_f_minusDELTAx = tf.stack([self.x_batch[:,0]-self.DELTA, self.y_batch[:,0], self.t_batch[:,0]], axis=1)
-      X_f_minusDELTAy = tf.stack([self.x_batch[:,0], self.y_batch[:,0]-self.DELTA, self.t_batch[:,0]], axis=1)
-      X_f_minus2DELTAx = tf.stack([self.x_batch[:,0]-(2.*self.DELTA), self.y_batch[:,0], self.t_batch[:,0]], axis=1)
-      X_f_minus2DELTAy = tf.stack([self.x_batch[:,0], self.y_batch[:,0]-(2.*self.DELTA), self.t_batch[:,0]], axis=1)
-      X_f_minusDELTAt = tf.stack([self.x_batch[:,0], self.y_batch[:,0], self.t_batch[:,0]-self.DELTA], axis=1)
-    else:
-      X_f = tf.stack([self.x_batch[:,0], self.y_batch[:,0]], axis=1)
-      X_f_minusDELTAx = tf.stack([self.x_batch[:,0]-self.DELTA, self.y_batch[:,0]], axis=1)
-      X_f_minusDELTAy = tf.stack([self.x_batch[:,0], self.y_batch[:,0]-self.DELTA], axis=1)
-      X_f_minus2DELTAx = tf.stack([self.x_batch[:,0]-(2.*self.DELTA), self.y_batch[:,0]], axis=1)
-      X_f_minus2DELTAy = tf.stack([self.x_batch[:,0], self.y_batch[:,0]-(2.*self.DELTA)], axis=1)
+    x_batch = self.x_batch[:self.batch_size,]
+    y_batch = self.y_batch[:self.batch_size,]
+    
+    X_f = tf.stack([x_batch[:,0], y_batch[:,0]], axis=1)
+    X_f_minusDELTAx = tf.stack([x_batch[:,0]-self.DELTA, y_batch[:,0]], axis=1)
+    X_f_minusDELTAy = tf.stack([x_batch[:,0], y_batch[:,0]-self.DELTA], axis=1)
+    X_f_minus2DELTAx = tf.stack([x_batch[:,0]-(2.*self.DELTA), y_batch[:,0]], axis=1)
+    X_f_minus2DELTAy = tf.stack([x_batch[:,0], y_batch[:,0]-(2.*self.DELTA)], axis=1)
 
-      
     # Getting deslocaded prediction
     u,v,p = self.Sliced_Predict(X_f)
     u_deltax, v_deltax, p_deltax = self.Sliced_Predict(X_f_minusDELTAx)
@@ -361,33 +349,33 @@ class PINN(object):
 
     if not self.steady:
       #first-order upwind (backward difference)  O(\Deltax^1)
-      u_deltat, v_deltat, _ = self.Sliced_Predict(X_f_minusDELTAt)
-      u_t = (u-u_deltat)/self.DELTA 
-      v_t = (v-v_deltat)/self.DELTA 
+      Previus = self.Previus_Pred_batch[:self.batch_size,]
+      u_deltat = tf.slice(Previus,[0,0],[-1,1])
+      v_deltat = tf.slice(Previus,[0,1],[-1,1])
+      u_t = (u-u_deltat)/self.DELTA_t
+      v_t = (v-v_deltat)/self.DELTA_t
     else:
       u_t = 0.
       v_t = 0.
 
     return u,v,p,u_x,u_y,u_t,v_x,v_y,v_t,p_x,p_y,u_xx,u_yy,v_xx,v_yy
   
-  @tf.function
+  # @tf.function
   def AD_scheme(self):
     # Using the new GradientTape paradigm of TF2.0,
     # which keeps track of operations to get the gradient at runtime
+    x_batch = self.x_batch[:self.batch_size,]
+    y_batch = self.y_batch[:self.batch_size,]
     with tf.GradientTape(persistent=True) as tape3:
-      tape3.watch(self.x_batch)
-      tape3.watch(self.y_batch)
+      tape3.watch(x_batch)
+      tape3.watch(y_batch)
       
       with tf.GradientTape(persistent=True) as tape4:
         # Watching the three inputs we’ll need later, x , y and t
-        tape4.watch(self.x_batch)
-        tape4.watch(self.y_batch)
-        if not self.steady:
-          tape4.watch(self.t_batch)
-          X_f = tf.stack([self.x_batch[:,0], self.y_batch[:,0], self.t_batch[:,0]], axis=1)
-        else:
-          # Packing together the inputs
-          X_f = tf.stack([self.x_batch[:,0], self.y_batch[:,0]], axis=1)
+        tape4.watch(x_batch)
+        tape4.watch(y_batch)
+        # Packing together the inputs
+        X_f = tf.stack([x_batch[:,0], y_batch[:,0]], axis=1)
   
         # Getting the prediction
         Pred =  tf.cast(self.model(X_f,training=True), self.dtype)
@@ -395,42 +383,50 @@ class PINN(object):
         v = tf.slice(Pred,[0,1],[-1,1])
         p = tf.slice(Pred,[0,2],[-1,1])
    
-      u_x = tape4.gradient(u, self.x_batch)
-      v_x = tape4.gradient(v, self.x_batch)
-      u_y = tape4.gradient(u, self.y_batch)
-      v_y = tape4.gradient(v, self.y_batch)
-      if not self.steady:
-        u_t = tape4.gradient(u, self.t_batch)
-        v_t = tape4.gradient(v, self.t_batch)
-      else:
-        u_t = 0.
-        v_t = 0.
+      u_x = tape4.gradient(u, x_batch)
+      v_x = tape4.gradient(v, x_batch)
+      u_y = tape4.gradient(u, y_batch)
+      v_y = tape4.gradient(v, y_batch)
     
     # Getting the other derivatives
-    u_xx = tape3.gradient(u_x, self.x_batch)
-    u_yy = tape3.gradient(u_y, self.y_batch)
-    v_xx = tape3.gradient(v_x, self.x_batch)
-    v_yy = tape3.gradient(v_y, self.y_batch)
-    p_x = tape3.gradient(p, self.x_batch)
-    p_y = tape3.gradient(p, self.y_batch)
+    u_xx = tape3.gradient(u_x, x_batch)
+    u_yy = tape3.gradient(u_y, y_batch)
+    v_xx = tape3.gradient(v_x, x_batch)
+    v_yy = tape3.gradient(v_y, y_batch)
+    p_x = tape3.gradient(p, x_batch)
+    p_y = tape3.gradient(p, y_batch)
         
     del tape3, tape4
+    
+    if not self.steady:
+      #first-order upwind (backward difference)  O(\Deltax^1)
+      Previus = self.Previus_Pred_batch[:self.batch_size,]
+      u_deltat = tf.slice(Previus,[0,0],[-1,1])
+      v_deltat = tf.slice(Previus,[0,1],[-1,1])
+      u_t = (u-u_deltat)/self.DELTA_t
+      v_t = (v-v_deltat)/self.DELTA_t
+    else:
+      u_t = 0.
+      v_t = 0.
 
     return u,v,p,u_x,u_y,u_t,v_x,v_y,v_t,p_x,p_y,u_xx,u_yy,v_xx,v_yy
   
-  @tf.function
+  # @tf.function
   def CAN_scheme(self):
     # Using the new GradientTape paradigm of TF2.0,
     # which keeps track of operations to get the gradient at runtime
+    x_batch = self.x_batch[:self.batch_size,]
+    y_batch = self.y_batch[:self.batch_size,]
+
     with tf.GradientTape(persistent=True) as tape3:
-      x_batch_minusDELTA = self.x_batch[:,0]-self.DELTA
-      x_batch_minus2DELTA = self.x_batch[:,0]-(2.*self.DELTA)
-      x_batch_plusDELTA = self.x_batch[:,0]+self.DELTA
-      y_batch_minusDELTA = self.y_batch[:,0]-self.DELTA
-      y_batch_minus2DELTA = self.y_batch[:,0]-(2.*self.DELTA)
-      y_batch_plusDELTA = self.y_batch[:,0]+self.DELTA
-      tape3.watch(self.x_batch)
-      tape3.watch(self.y_batch)
+      x_batch_minusDELTA = x_batch[:,0]-self.DELTA
+      x_batch_minus2DELTA = x_batch[:,0]-(2.*self.DELTA)
+      x_batch_plusDELTA = x_batch[:,0]+self.DELTA
+      y_batch_minusDELTA = y_batch[:,0]-self.DELTA
+      y_batch_minus2DELTA =y_batch[:,0]-(2.*self.DELTA)
+      y_batch_plusDELTA = y_batch[:,0]+self.DELTA
+      tape3.watch(x_batch)
+      tape3.watch(y_batch)
       tape3.watch(x_batch_minusDELTA)
       tape3.watch(y_batch_minusDELTA)
       tape3.watch(x_batch_plusDELTA)
@@ -438,32 +434,19 @@ class PINN(object):
       
       with tf.GradientTape(persistent=True) as tape4:
         # Watching the three inputs we’ll need later, x , y and t
-        tape4.watch(self.x_batch)
-        tape4.watch(self.y_batch)
+        tape4.watch(x_batch)
+        tape4.watch(y_batch)
         tape4.watch(x_batch_minusDELTA)
         tape4.watch(y_batch_minusDELTA)
         
-        if not self.steady:
-          t_batch_minusDELTA = self.t_batch[:,0]-self.DELTA
-          tape4.watch(self.t_batch)
-          tape4.watch(t_batch_minusDELTA)
-          X_f = tf.stack([self.x_batch[:,0], self.y_batch[:,0], self.t_batch[:,0]], axis=1)
-          X_f_minusDELTAx = tf.stack([x_batch_minusDELTA, self.y_batch[:,0], self.t_batch[:,0]], axis=1)
-          X_f_minusDELTAy = tf.stack([self.x_batch[:,0], y_batch_minusDELTA, self.t_batch[:,0]], axis=1)
-          X_f_minus2DELTAx = tf.stack([x_batch_minus2DELTA, self.y_batch[:,0], self.t_batch[:,0]], axis=1)
-          X_f_minus2DELTAy = tf.stack([self.x_batch[:,0], y_batch_minus2DELTA, self.t_batch[:,0]], axis=1)
-          X_f_plusDELTAx = tf.stack([x_batch_plusDELTA, self.y_batch[:,0], self.t_batch[:,0]], axis=1)
-          X_f_plusDELTAy = tf.stack([self.x_batch[:,0], y_batch_plusDELTA, self.t_batch[:,0]], axis=1)
-          X_f_minusDELTAt = tf.stack([self.x_batch[:,0], self.y_batch[:,0], t_batch_minusDELTA], axis=1)
-          u_deltat, v_deltat, _ = self.Sliced_Predict(X_f_minusDELTAt)
-        else:
-          X_f = tf.stack([self.x_batch[:,0], self.y_batch[:,0]], axis=1)
-          X_f_minusDELTAx = tf.stack([x_batch_minusDELTA, self.y_batch[:,0]], axis=1)
-          X_f_minusDELTAy = tf.stack([self.x_batch[:,0], y_batch_minusDELTA], axis=1)
-          X_f_minus2DELTAx = tf.stack([x_batch_minus2DELTA, self.y_batch[:,0]], axis=1)
-          X_f_minus2DELTAy = tf.stack([self.x_batch[:,0], y_batch_minus2DELTA], axis=1)
-          X_f_plusDELTAx = tf.stack([x_batch_plusDELTA, self.y_batch[:,0]], axis=1)
-          X_f_plusDELTAy = tf.stack([self.x_batch[:,0], y_batch_plusDELTA], axis=1)
+
+        X_f = tf.stack([x_batch[:,0], y_batch[:,0]], axis=1)
+        X_f_minusDELTAx = tf.stack([x_batch_minusDELTA, y_batch[:,0]], axis=1)
+        X_f_minusDELTAy = tf.stack([x_batch[:,0], y_batch_minusDELTA], axis=1)
+        X_f_minus2DELTAx = tf.stack([x_batch_minus2DELTA, y_batch[:,0]], axis=1)
+        X_f_minus2DELTAy = tf.stack([x_batch[:,0], y_batch_minus2DELTA], axis=1)
+        X_f_plusDELTAx = tf.stack([x_batch_plusDELTA, y_batch[:,0]], axis=1)
+        X_f_plusDELTAy = tf.stack([x_batch[:,0], y_batch_plusDELTA], axis=1)
   
         # Getting the prediction
         # Getting deslocaded prediction
@@ -475,10 +458,10 @@ class PINN(object):
         _, _, p_pdeltax = self.Sliced_Predict(X_f_plusDELTAx)
         _, _, p_pdeltay = self.Sliced_Predict(X_f_plusDELTAy)
 
-      ad_u_x = tape4.gradient(u, self.x_batch)
-      ad_v_x = tape4.gradient(v, self.x_batch)
-      ad_u_y = tape4.gradient(u, self.y_batch)
-      ad_v_y = tape4.gradient(v, self.y_batch)
+      ad_u_x = tape4.gradient(u, x_batch)
+      ad_v_x = tape4.gradient(v, x_batch)
+      ad_u_y = tape4.gradient(u, y_batch)
+      ad_v_y = tape4.gradient(v, y_batch)
       ad_u_x_delta = tape4.gradient(u_deltax, x_batch_minusDELTA)
       ad_v_x_delta = tape4.gradient(v_deltax, x_batch_minusDELTA)
       ad_u_y_delta = tape4.gradient(u_deltay, y_batch_minusDELTA)
@@ -488,24 +471,30 @@ class PINN(object):
       v_x = ((v - v_deltax)/self.DELTA) + (ad_v_x - ad_v_x_delta)/2.
       u_y = ((u - u_deltay)/self.DELTA) + (ad_u_y - ad_u_y_delta)/2.
       v_y = ((v - v_deltay)/self.DELTA) + (ad_v_y - ad_v_y_delta)/2.
-      if not self.steady:
-        u_t = ((u-u_deltat)/self.DELTA) + (tape4.gradient(u, self.t_batch)-tape4.gradient(u_deltat, t_batch_minusDELTA))/2.
-        v_t = ((v-v_deltat)/self.DELTA) + (tape4.gradient(v, self.t_batch)-tape4.gradient(v_deltat, t_batch_minusDELTA))/2.
-      else:
-        u_t = 0.
-        v_t = 0.
-    
+          
     # Getting the other derivatives
-    u_xx = ((u - 2.0*u_deltax + u_2deltax)/(self.DELTA**2)) + (tape3.gradient(ad_u_x, self.x_batch)-tape3.gradient(ad_u_x_delta, x_batch_minusDELTA))/2.
-    u_yy = ((u - 2.0*u_deltay + u_2deltay)/(self.DELTA**2)) + (tape3.gradient(ad_u_y, self.y_batch)-tape3.gradient(ad_u_y_delta, y_batch_minusDELTA))/2.
-    v_xx = ((v - 2.0*v_deltax + v_2deltax)/(self.DELTA**2)) + (tape3.gradient(ad_v_x, self.x_batch)-tape3.gradient(ad_v_x_delta, x_batch_minusDELTA))/2.
-    v_yy = ((v - 2.0*v_deltay + v_2deltay)/(self.DELTA**2)) + (tape3.gradient(ad_v_y, self.y_batch)-tape3.gradient(ad_v_y_delta, y_batch_minusDELTA))/2.
-    p_x = ((p_pdeltax - p_deltax)/(2.*self.DELTA)) - (tape3.gradient(p_pdeltax, x_batch_plusDELTA) -2.0*tape3.gradient(p, self.x_batch)+ tape3.gradient(p_deltax, x_batch_minusDELTA))/8.
-    p_y = ((p_pdeltay - p_deltay)/(2.*self.DELTA)) - (tape3.gradient(p_pdeltay, y_batch_plusDELTA) -2.0*tape3.gradient(p, self.y_batch)+ tape3.gradient(p_deltay, y_batch_minusDELTA))/8.
+    u_xx = ((u - 2.0*u_deltax + u_2deltax)/(self.DELTA**2)) + (tape3.gradient(ad_u_x, x_batch)-tape3.gradient(ad_u_x_delta, x_batch_minusDELTA))/2.
+    u_yy = ((u - 2.0*u_deltay + u_2deltay)/(self.DELTA**2)) + (tape3.gradient(ad_u_y, y_batch)-tape3.gradient(ad_u_y_delta, y_batch_minusDELTA))/2.
+    v_xx = ((v - 2.0*v_deltax + v_2deltax)/(self.DELTA**2)) + (tape3.gradient(ad_v_x, x_batch)-tape3.gradient(ad_v_x_delta, x_batch_minusDELTA))/2.
+    v_yy = ((v - 2.0*v_deltay + v_2deltay)/(self.DELTA**2)) + (tape3.gradient(ad_v_y, y_batch)-tape3.gradient(ad_v_y_delta, y_batch_minusDELTA))/2.
+    p_x = ((p_pdeltax - p_deltax)/(2.*self.DELTA)) - (tape3.gradient(p_pdeltax, x_batch_plusDELTA) -2.0*tape3.gradient(p, x_batch)+ tape3.gradient(p_deltax, x_batch_minusDELTA))/8.
+    p_y = ((p_pdeltay - p_deltay)/(2.*self.DELTA)) - (tape3.gradient(p_pdeltay, y_batch_plusDELTA) -2.0*tape3.gradient(p, y_batch)+ tape3.gradient(p_deltay, y_batch_minusDELTA))/8.
     del tape3, tape4
+    
+    if not self.steady:
+      #first-order upwind (backward difference)  O(\Deltax^1)
+      Previus = self.Previus_Pred_batch[:self.batch_size,]
+      u_deltat = tf.slice(Previus,[0,0],[-1,1])
+      v_deltat = tf.slice(Previus,[0,1],[-1,1])
+      u_t = (u-u_deltat)/self.DELTA_t
+      v_t = (v-v_deltat)/self.DELTA_t
+    else:
+      u_t = 0.
+      v_t = 0.
+    
     return u,v,p,u_x,u_y,u_t,v_x,v_y,v_t,p_x,p_y,u_xx,u_yy,v_xx,v_yy
   
-  @tf.function
+  # @tf.function
   def LR_Annealing(self):
     
     with tf.GradientTape(persistent=True) as tape2:
@@ -535,7 +524,7 @@ class PINN(object):
            self.term_weights[2] * self.LR_alpha * loss_dt
     return loss
   
-  @tf.function
+  # @tf.function
   def DW_balance(self,losses):
     # calculate loss and losses
     self.lossmemory_dt.assign(self.EMA( (losses[4]) , self.lossmemory_dt, self.EMA_decay))
@@ -564,7 +553,7 @@ class PINN(object):
         self.term_weights[2] * self.alpha * losses[4]
     return loss
   
-  @tf.function
+  # @tf.function
   def DW_ReLoBRaLo(self,losses):
     saudade = tf.random.normal([1],mean=1,stddev=self.rho_std,dtype=self.dtype)
     saudade  = tf.math.minimum(tf.math.maximum(saudade[0],0),1)    
@@ -596,41 +585,29 @@ class PINN(object):
 
     return loss
 
-  @tf.function
+  # @tf.function
   def EMA(self,new,previous,decay):
     return (1-decay)*previous + decay*new
 
-  @tf.function
+  # @tf.function
   def summary(self):
     return self.model.summary()
-
+  
   # The training function
-  # @tf.function
-  def fit(self, X_bd_vel, Y_bd_vel,X_bd_pre, Y_bd_pre,
-          X_data,Y_data, tf_epochs=5000, batch_size = 128 ):
+  def fit(self, tf_epochs=5000, batch_size = 128 ):
 
     self.logger.log_train_start(self)
-    # Creating the tensors
-    self.X_bd_vel = tf.convert_to_tensor(X_bd_vel, dtype=self.dtype)
-    self.Y_bd_vel = tf.convert_to_tensor(Y_bd_vel, dtype=self.dtype)
-    self.X_bd_pre = tf.convert_to_tensor(X_bd_pre, dtype=self.dtype)
-    self.Y_bd_pre = tf.convert_to_tensor(Y_bd_pre, dtype=self.dtype)
-    self.X_data = tf.convert_to_tensor(X_data, dtype=self.dtype)
-    self.Y_data = tf.convert_to_tensor(Y_data, dtype=self.dtype)
-    train_dataset =tf.data.Dataset.from_tensor_slices(self.X_pinn_train)
-    self.x_batch = tf.Variable(tf.zeros(shape = [batch_size,1]), trainable=False, dtype=self.dtype)
-    self.y_batch = tf.Variable(tf.zeros(shape = [batch_size,1]), trainable=False, dtype=self.dtype)
-    self.t_batch = tf.Variable(tf.zeros(shape = [batch_size,1]), trainable=False, dtype=self.dtype)
-
+    train_dataset =tf.data.Dataset.from_tensor_slices(tf.concat([self.X_pinn_train,self.Previus_Pred],1))
     for epoch in range(tf_epochs):
       # batch step
       train_batchs = train_dataset.shuffle(self.X_pinn_train.shape[0],reshuffle_each_iteration = True).batch(batch_size).enumerate()
       for step, batch in train_batchs:
         batch = tf.convert_to_tensor(batch, dtype=self.dtype)
-        self.x_batch[:batch.shape[0],].assign(batch[:, 0:1])
-        self.y_batch[:batch.shape[0],].assign(batch[:, 1:2])
-        if not self.steady:
-          self.t_batch[:batch.shape[0],].assing(batch[:, 2:3])
+        self.batch_size.assign(batch.shape[0]) 
+        
+        self.x_batch[:self.batch_size,].assign(batch[:, 0:1])
+        self.y_batch[:self.batch_size,].assign(batch[:, 1:2])
+        self.Previus_Pred_batch[:self.batch_size,].assign(batch[:, 2:])
         # Optimization step
         loss_value = self.train_step()
         
@@ -641,30 +618,48 @@ class PINN(object):
   # Train in tf graph mode
   @tf.function
   def train_step(self):
-    
+    print('Tracing! ...')
     loss_value, grads = self.f_grad()
     self.optimizer.apply_gradients(zip(grads, self.model.trainable_variables))
     # check graph mode
     # tf.print("Eager execution: {}".format(tf.executing_eagerly())) 
     return loss_value
-    
   
+  def Compile(self,X_bd_vel, Y_bd_vel,X_bd_pre, Y_bd_pre, X_data,Y_data,X_outside=[],previus_pred=[]):
+    if self.Set_Data_flag==0:
+      # Creating the tensors
+      self.X_bd_vel = tf.Variable(X_bd_vel, trainable=False, dtype=self.dtype)
+      self.Y_bd_vel = tf.Variable(Y_bd_vel, trainable=False, dtype=self.dtype)
+      self.X_bd_pre = tf.Variable(X_bd_pre, trainable=False, dtype=self.dtype)
+      self.Y_bd_pre = tf.Variable(Y_bd_pre, trainable=False, dtype=self.dtype)
+      self.X_data = tf.Variable(X_data, trainable=False, dtype=self.dtype)
+      self.Y_data = tf.Variable(Y_data, trainable=False, dtype=self.dtype)
+      self.X_outside = tf.Variable(X_outside, trainable=False, dtype=self.dtype)
+      self.Previus_Pred = tf.Variable(previus_pred, trainable=False, dtype=self.dtype)
+      self.Previus_Pred_batch = tf.Variable(tf.zeros(shape = previus_pred.shape), trainable=False, dtype=self.dtype)
+      self.Set_Data_flag.assign(3)
+    else:
+      self.X_bd_vel.assign(X_bd_vel)
+      self.Y_bd_vel.assign(Y_bd_vel)
+      self.X_bd_pre.assign(X_bd_pre)
+      self.Y_bd_pre.assign(Y_bd_pre)
+      self.X_data.assign(X_data)
+      self.Y_data.assign(Y_data)
+      self.X_outside.assign(X_outside)
+      self.Previus_Pred.assign(previus_pred)
+      
   # @tf.function
   def predict(self, X_star):
     u_star = self.model(X_star,training=False)
     return u_star
   
-  @tf.function
+  # @tf.function
   def Sliced_Predict(self,X):
     Pred =  tf.cast(self.model(X,training=True), self.dtype)
     u = tf.slice(Pred,[0,0],[-1,1])
     v = tf.slice(Pred,[0,1],[-1,1])
     p = tf.slice(Pred,[0,2],[-1,1])
     return u,v,p
-  
-  def set_outside_points(self,points):
-    self.X_outside =tf.convert_to_tensor(points, dtype=self.dtype)
-    return
   
   def start_dynamic_weight(self,pinn_w = [1,1,1,1,1,1], dynamic_weight_method = 'NONE', term_weights = [1,1,1],
                          w_decay = 0.1, weight_update_step = 200, start = 1, EMA_decay = 0.04,
@@ -739,29 +734,29 @@ class PINN(object):
     self.pinn_w.assign(pinn_w)
     self.term_weights.assign(term_weights)
     self.dynamic_weight_method.assign(dynamic_weight_method)
-    if self.dynamic_weight_method == 'balance':
-      self.w_decay.assign(w_decay)
-      self.EMA_decay.assign(EMA_decay)
-      self.weight_update.assign(weight_update_step)
-      self.lossmemory_dt.assign(0)
-      self.lossmemory_bd.assign(0)
-      self.alpha_star.assign(0)
-      self.beta_star.assign(0)
-      self.alpha.assign(start)
-      self.beta.assign(start)
-      self.max_loss_eq.assign(0)
-      self.inter_count.assign(0)
-    elif self.dynamic_weight_method == 'relobralo':
-      self.T.assign(temperature)
-      self.previus_loss.assign([0,0,0])
-      self.previus_lamb.assign([0,0,0])
-      self.lamb_0.assign([0,0,0])
-      self.alpha_decay.assign(alpha_decay)
-      self.rho_std.assign(rho_std)
-    elif self.dynamic_weight_method == 'LR_annealing':
-      self.LR_alpha.assign(start)
-      self.LR_beta.assign(start)
-      self.LR_decay.assign(LR_decay)
+    # if self.dynamic_weight_method == 'balance':
+    #   self.w_decay.assign(w_decay)
+    #   self.EMA_decay.assign(EMA_decay)
+    #   self.weight_update.assign(weight_update_step)
+    #   self.lossmemory_dt.assign(0)
+    #   self.lossmemory_bd.assign(0)
+    #   self.alpha_star.assign(0)
+    #   self.beta_star.assign(0)
+    #   self.alpha.assign(start)
+    #   self.beta.assign(start)
+    #   self.max_loss_eq.assign(0)
+    #   self.inter_count.assign(0)
+    # elif self.dynamic_weight_method == 'relobralo':
+    #   self.T.assign(temperature)
+    #   self.previus_loss.assign([0,0,0])
+    #   self.previus_lamb.assign([0,0,0])
+    #   self.lamb_0.assign([0,0,0])
+    #   self.alpha_decay.assign(alpha_decay)
+    #   self.rho_std.assign(rho_std)
+    # elif self.dynamic_weight_method == 'LR_annealing':
+    #   self.LR_alpha.assign(start)
+    #   self.LR_beta.assign(start)
+    #   self.LR_decay.assign(LR_decay)
     return
 
 class Logs(object):
@@ -810,9 +805,10 @@ class Logs(object):
 
 
   def log_train_batch(self, batch, loss, losses, custom=""):
-    if tf.math.floormod(batch , self.frequency_batch) == 0:
-      self.loss.append([losses[0].numpy(),losses[1].numpy(),losses[2].numpy(),losses[3].numpy(),losses[4].numpy(),losses[5].numpy()])
-      print(f"batch = {batch:3d}  elapsed = {self.__get_elapsed()}  loss = {loss:.4e} * {losses[0]:.2e} {losses[1]:.2e} {losses[2]:.2e} {losses[3]:.2e} {losses[4]:.2e} {losses[5]:.2e}" + custom)
+    if self.frequency_batch > 0:
+      if tf.math.floormod(batch , self.frequency_batch) == 0:
+        self.loss.append([losses[0].numpy(),losses[1].numpy(),losses[2].numpy(),losses[3].numpy(),losses[4].numpy(),losses[5].numpy()])
+        print(f"batch = {batch:3d}  elapsed = {self.__get_elapsed()}  loss = {loss:.4e} * {losses[0]:.2e} {losses[1]:.2e} {losses[2]:.2e} {losses[3]:.2e} {losses[4]:.2e} {losses[5]:.2e}" + custom)
 
   def log_train_end(self, epoch, custom=""):
     print("==================")
