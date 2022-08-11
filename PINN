@@ -240,14 +240,18 @@ class PINN(object):
   # @tf.function
   def Navier_Stokes_Residuals(self):
     #chose differentiation method
-    if self.diff_method == 'ND1':
-      Diff_scheme = self.ND_First_Upwind
-    elif self.diff_method == 'ND2':
-      Diff_scheme = self.ND_Second_Upwind
+    if self.diff_method == 'CD2':
+      Diff_scheme = self.ND_Second_CentralDiff
+    elif self.diff_method == 'CD4':
+      Diff_scheme = self.ND_Fourth_CentralDiff
     elif self.diff_method == 'AD':
       Diff_scheme = self.AD_scheme
     elif self.diff_method == 'CAN':
       Diff_scheme = self.CAN_scheme
+    elif self.diff_method == 'UW1':
+      Diff_scheme = self.ND_First_Upwind
+    elif self.diff_method == 'UW2':
+      Diff_scheme = self.ND_Second_Upwind
     else:
       Diff_scheme =  self.AD_scheme
       
@@ -261,6 +265,111 @@ class PINN(object):
     #loss_momentum = (loss_x + loss_y)   'can be weighted to balance components residual'
     return (loss_x + loss_y), loss_mass
     
+  # Models of PINN loss N-pinn
+  # @tf.function
+  def ND_Fourth_CentralDiff(self):
+    # Using numerical diferentiation 4 order centered difference for velocity and pressure, and 1 order upwind for time
+    # Packing the inputs together 
+    x_batch = self.x_batch[:self.batch_size,]
+    y_batch = self.y_batch[:self.batch_size,]
+        
+    X_f = tf.stack([x_batch[:,0], y_batch[:,0]], axis=1)
+    X_f_minusDELTAx = tf.stack([x_batch[:,0]-self.DELTA, y_batch[:,0]], axis=1)
+    X_f_minusDELTAy = tf.stack([x_batch[:,0], y_batch[:,0]-self.DELTA], axis=1)
+    X_f_minus2DELTAx = tf.stack([x_batch[:,0]-(2.*self.DELTA), y_batch[:,0]], axis=1)
+    X_f_minus2DELTAy = tf.stack([x_batch[:,0], y_batch[:,0]-(2.*self.DELTA)], axis=1)
+    X_f_plusDELTAx = tf.stack([x_batch[:,0]+self.DELTA, y_batch[:,0]], axis=1)
+    X_f_plusDELTAy = tf.stack([x_batch[:,0], y_batch[:,0]+self.DELTA], axis=1)
+    X_f_plus2DELTAx = tf.stack([x_batch[:,0]+(2.*self.DELTA), y_batch[:,0]], axis=1)
+    X_f_plus2DELTAy = tf.stack([x_batch[:,0], y_batch[:,0]+(2.*self.DELTA)], axis=1)
+
+
+      
+    # Getting deslocaded prediction
+    u,v,p = self.Sliced_Predict(X_f)
+    u_mdeltax, v_mdeltax, p_mdeltax = self.Sliced_Predict(X_f_minusDELTAx)
+    u_mdeltay, v_mdeltay, p_mdeltay = self.Sliced_Predict(X_f_minusDELTAy)
+    u_m2deltax, v_m2deltax, p_m2deltax =self.Sliced_Predict(X_f_minus2DELTAx)
+    u_m2deltay, v_m2deltay, p_m2deltay =self.Sliced_Predict(X_f_minus2DELTAy)
+    
+    u_pdeltax, v_pdeltax, p_pdeltax = self.Sliced_Predict(X_f_plusDELTAx)
+    u_pdeltay, v_pdeltay, p_pdeltay = self.Sliced_Predict(X_f_plusDELTAy)
+    u_p2deltax, v_p2deltax, p_p2deltax =self.Sliced_Predict(X_f_plus2DELTAx)
+    u_p2deltay, v_p2deltay, p_p2deltay =self.Sliced_Predict(X_f_plus2DELTAy)
+   
+    
+    # Fourth-order central difference   O(\Deltax^4)
+    u_x = (-u_p2deltax + 8.*u_pdeltax - 8.*u_mdeltax + u_m2deltax)/(12.*self.DELTA)
+    v_x = (-v_p2deltax + 8.*v_pdeltax - 8.*v_mdeltax + v_m2deltax)/(12.*self.DELTA)
+    u_y = (-u_p2deltay + 8.*u_pdeltay - 8.*u_mdeltay + u_m2deltay)/(12.*self.DELTA)
+    v_y = (-v_p2deltay + 8.*v_pdeltay - 8.*v_mdeltay + v_m2deltay)/(12.*self.DELTA)
+    p_x = (-p_p2deltax + 8.*p_pdeltax - 8.*p_mdeltax + p_m2deltax)/(12.*self.DELTA)
+    p_y = (-p_p2deltay + 8.*p_pdeltay - 8.*p_mdeltay + p_m2deltay)/(12.*self.DELTA)
+      # Getting the second other derivatives
+    u_xx = (-u_p2deltax + 16.*u_pdeltax - 30.*u + 16.*u_mdeltax - u_m2deltax)/(12.*(self.DELTA**2))
+    u_yy = (-u_p2deltay + 16.*u_pdeltay - 30.*u + 16.*u_mdeltay - u_m2deltay)/(12.*(self.DELTA**2))
+    v_xx = (-v_p2deltax + 16.*v_pdeltax - 30.*v + 16.*v_mdeltax - v_m2deltax)/(12.*(self.DELTA**2))
+    v_yy = (-v_p2deltay + 16.*v_pdeltay - 30.*v + 16.*v_mdeltay - v_m2deltay)/(12.*(self.DELTA**2))
+
+    if not self.steady:
+      #first-order upwind (backward difference)  O(\Deltax^1)
+      Previus = self.Previus_Pred_batch[:self.batch_size,]
+      u_deltat = tf.slice(Previus,[0,0],[-1,1])
+      v_deltat = tf.slice(Previus,[0,1],[-1,1])
+      u_t = (u-u_deltat)/self.DELTA_t
+      v_t = (v-v_deltat)/self.DELTA_t
+    else:
+      u_t = 0.
+      v_t = 0.
+ 
+    return u,v,p,u_x,u_y,u_t,v_x,v_y,v_t,p_x,p_y,u_xx,u_yy,v_xx,v_yy
+  
+  # Models of PINN loss N-pinn
+  # @tf.function
+  def ND_Second_CentralDiff(self):
+    # Using numerical diferentiation 2 order centered difference for velocity and pressure, and 1 order upwind for time
+    # Packing the inputs together 
+    x_batch = self.x_batch[:self.batch_size,]
+    y_batch = self.y_batch[:self.batch_size,]
+        
+    X_f = tf.stack([x_batch[:,0], y_batch[:,0]], axis=1)
+    X_f_minusDELTAx = tf.stack([x_batch[:,0]-self.DELTA, y_batch[:,0]], axis=1)
+    X_f_minusDELTAy = tf.stack([x_batch[:,0], y_batch[:,0]-self.DELTA], axis=1)
+    X_f_plusDELTAx = tf.stack([x_batch[:,0]+self.DELTA, y_batch[:,0]], axis=1)
+    X_f_plusDELTAy = tf.stack([x_batch[:,0], y_batch[:,0]+self.DELTA], axis=1)
+
+    # Getting deslocaded prediction
+    u,v,p = self.Sliced_Predict(X_f)
+    u_mdeltax, v_mdeltax, p_mdeltax = self.Sliced_Predict(X_f_minusDELTAx)
+    u_mdeltay, v_mdeltay, p_mdeltay = self.Sliced_Predict(X_f_minusDELTAy)    
+    u_pdeltax, v_pdeltax, p_pdeltax = self.Sliced_Predict(X_f_plusDELTAx)
+    u_pdeltay, v_pdeltay, p_pdeltay = self.Sliced_Predict(X_f_plusDELTAy)
+
+    # Second-order central difference   O(\Deltax^2)
+    u_x = (u_pdeltax - u_mdeltax)/(2.*self.DELTA)
+    v_x = (v_pdeltax - v_mdeltax)/(2.*self.DELTA)
+    u_y = (u_pdeltay - u_mdeltay)/(2.*self.DELTA)
+    v_y = (v_pdeltay - v_mdeltay)/(2.*self.DELTA)
+    p_x = (p_pdeltax - p_mdeltax)/(2.*self.DELTA)
+    p_y = (p_pdeltay - p_mdeltay)/(2.*self.DELTA)
+      # Getting the second other derivatives
+    u_xx = (u_pdeltax -2.*u + u_mdeltax)/(self.DELTA**2)
+    u_yy = (u_pdeltay -2.*u + u_mdeltay)/(self.DELTA**2)
+    v_xx = (v_pdeltax -2.*v + v_mdeltax)/(self.DELTA**2)
+    v_yy = (v_pdeltay -2.*v + v_mdeltay)/(self.DELTA**2)
+
+    if not self.steady:
+      #first-order upwind (backward difference)  O(\Deltax^1)
+      Previus = self.Previus_Pred_batch[:self.batch_size,]
+      u_deltat = tf.slice(Previus,[0,0],[-1,1])
+      v_deltat = tf.slice(Previus,[0,1],[-1,1])
+      u_t = (u-u_deltat)/self.DELTA_t
+      v_t = (v-v_deltat)/self.DELTA_t
+    else:
+      u_t = 0.
+      v_t = 0.
+ 
+    return u,v,p,u_x,u_y,u_t,v_x,v_y,v_t,p_x,p_y,u_xx,u_yy,v_xx,v_yy
   
   # Models of PINN loss N-pinn
   # @tf.function
@@ -625,7 +734,7 @@ class PINN(object):
     # tf.print("Eager execution: {}".format(tf.executing_eagerly())) 
     return loss_value
   
-  def Compile(self,X_bd_vel, Y_bd_vel,X_bd_pre, Y_bd_pre, X_data,Y_data,X_outside=[],previus_pred=[]):
+  def Compile(self,X_bd_vel, Y_bd_vel,X_bd_pre, Y_bd_pre, X_data,Y_data,previus_pred=[],X_outside=[]):
     if self.Set_Data_flag==0:
       # Creating the tensors
       self.X_bd_vel = tf.Variable(X_bd_vel, trainable=False, dtype=self.dtype)
@@ -635,8 +744,17 @@ class PINN(object):
       self.X_data = tf.Variable(X_data, trainable=False, dtype=self.dtype)
       self.Y_data = tf.Variable(Y_data, trainable=False, dtype=self.dtype)
       self.X_outside = tf.Variable(X_outside, trainable=False, dtype=self.dtype)
-      self.Previus_Pred = tf.Variable(previus_pred, trainable=False, dtype=self.dtype)
-      self.Previus_Pred_batch = tf.Variable(tf.zeros(shape = previus_pred.shape), trainable=False, dtype=self.dtype)
+      self.Previus_Pred_batch = tf.Variable(tf.zeros(shape = [self.X_pinn_train.shape[0],3]), trainable=False, dtype=self.dtype)
+
+      if not self.steady:
+        if not previus_pred.shape == (self.X_pinn_train.shape[0],3):
+          print('---------- TypeError: previus time wrong shape---------------')
+          print(previus_pred.shape,(self.X_pinn_train.shape[0],3))
+        else:
+          self.Previus_Pred = tf.Variable(previus_pred, trainable=False, dtype=self.dtype)
+      else:
+          self.Previus_Pred = tf.Variable(tf.zeros(shape = [self.X_pinn_train.shape[0],3]), trainable=False, dtype=self.dtype)
+            
       self.Set_Data_flag.assign(3)
     else:
       self.X_bd_vel.assign(X_bd_vel)
